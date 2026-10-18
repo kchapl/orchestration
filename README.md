@@ -25,11 +25,13 @@ over every non-archived, non-fork repo the token can see:
 | Primary language | `repos/{repo}` metadata |
 | Archival candidate | no human-authored commit in over a year |
 
-Every sensor runs in isolation: a sensor that fails (feature disabled, missing
-tool, API error) is reported as a warning and in the issue body, and the other
-sensors still run. Findings — not sensor health — decide whether an issue is
-raised. An authentication failure is the one hard error, so a broken token can
-never produce a green "all clean" run.
+Every sensor runs in isolation: a sensor that fails (missing tool, API error) is
+reported as a warning and in the issue body, and the other sensors still run.
+A feature that is simply not enabled for the repo — CodeQL with no analyses
+(`HTTP 404`), Dependabot alerts switched off — is a note in its section, not a
+warning, because it says nothing about the repo's health. Findings, not sensor
+health, decide whether an issue is raised. An authentication failure is the one
+hard error, so a broken token can never produce a green "all clean" run.
 
 ### Running the audit locally
 
@@ -49,3 +51,8 @@ REPO=owner/name TARGET_DIR=/path/to/checkout ./.github/scripts/audit-repo.sh
 | --- | --- |
 | `ORCHESTRATOR_PAT` | repo discovery, issue writes, checkouts, PR pushes |
 | `GEMINI_API_KEY` | OpenHands model access in phase 2 |
+
+`ORCHESTRATOR_PAT` also needs read access to security alerts, otherwise phase 1
+reports "the token cannot read …". On a classic PAT that is the
+`security_events` scope; on a fine-grained PAT grant *Dependabot alerts: read*
+and *Code scanning alerts: read*.

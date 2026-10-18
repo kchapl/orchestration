@@ -42,15 +42,42 @@ fail() { printf '::error::%s\n' "$*"; printf 'error: %s\n' "$*" >&2; exit 1; }
 
 # Run a sensor function, converting a non-zero exit into a warning instead of
 # aborting the audit. Sensors write their findings to $WORKDIR/<name>.
+#
+# Exit codes: 0 = done, 3 = sensor does not apply to this repo (feature not
+# enabled), anything else = genuine sensor failure.
 run_sensor() {
-  local name=$1 fn=$2 err
-  if err=$("$fn" 2>&1 >/dev/null); then
+  local name=$1 fn=$2 rc=0 err
+  err=$("$fn" 2>&1 >/dev/null) || rc=$?
+  if ((rc == 0)); then
     log "  ok    $name"
     return 0
   fi
   err=${err//$'\n'/; }
+  if ((rc == 3)); then
+    log "  skip  $name (${err:-not applicable to this repository})"
+    return 0
+  fi
   warn "$name sensor failed: ${err:-no details}"
   printf -- '- **%s**: sensor failed — %s\n' "$name" "${err:-no details}" >>"$WORKDIR/warnings"
+}
+
+capitalize() { local first=${1:0:1}; printf '%s%s' "${first^^}" "${1:1}"; }
+
+# Classify a gh api failure. Prints a human-readable reason and returns:
+#   3 = the feature is not enabled / has no data (404), which is not a fault
+#   0 = a real failure worth warning about
+gh_error_reason() { # <stderr from gh> <feature name>
+  local err=$1 feature=$2
+  if [[ $err == *"HTTP 404"* || $err == *"no analysis found"* ]]; then
+    printf '%s is not enabled for this repository, or has no analyses yet.' "$feature"
+    return 3
+  fi
+  if [[ $err == *"HTTP 403"* || $err == *"Resource not accessible"* || $err == *"scope"* ]]; then
+    printf 'the token cannot read %s. Grant "security_events" (classic PAT) or the matching read permission on a fine-grained PAT.' "$feature"
+    return 0
+  fi
+  printf '%s' "${err%%$'\n'*}"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -58,24 +85,38 @@ run_sensor() {
 # ---------------------------------------------------------------------------
 
 sensor_dependabot() {
-  local out
-  out=$(gh api --paginate --jq \
+  local out reason status
+  if ! out=$(gh api --paginate --jq \
     '.[] | "- **\(.security_advisory.severity | ascii_upcase)** \(.security_vulnerability.package.name) — \(.security_advisory.summary) ([alert #\(.number)](\(.html_url)))"' \
-    "repos/$REPO/dependabot/alerts?state=open&per_page=100") || {
-    printf 'alert API unavailable (disabled, or token lacks "security_events")\n' >&2
+    "repos/$REPO/dependabot/alerts?state=open&per_page=100" 2>&1); then
+    reason=$(gh_error_reason "$out" "Dependabot alerts")
+    status=$?
+    if ((status == 3)); then
+      printf '_%s_\n' "$(capitalize "$reason")" >"$WORKDIR/dependabot_note"
+      printf '%s\n' "$reason" >&2
+      return 3
+    fi
+    printf '%s\n' "$reason" >&2
     return 1
-  }
+  fi
   printf '%s\n' "$out" | sed '/^$/d' >"$WORKDIR/dependabot"
 }
 
 sensor_codeql() {
-  local out
-  out=$(gh api --paginate --jq \
+  local out reason status
+  if ! out=$(gh api --paginate --jq \
     '.[] | "- **\(.rule.severity // .rule.security_severity_level // "warning")** \(.rule.id) — \(.rule.description) (\(.most_recent_instance.location.path // "unknown path"))"' \
-    "repos/$REPO/code-scanning/alerts?state=open&per_page=100") || {
-    printf 'code scanning API unavailable (CodeQL not enabled, or token lacks "security_events")\n' >&2
+    "repos/$REPO/code-scanning/alerts?state=open&per_page=100" 2>&1); then
+    reason=$(gh_error_reason "$out" "code scanning")
+    status=$?
+    if ((status == 3)); then
+      printf '_%s_\n' "$(capitalize "$reason")" >"$WORKDIR/codeql_note"
+      printf '%s\n' "$reason" >&2
+      return 3
+    fi
+    printf '%s\n' "$reason" >&2
     return 1
-  }
+  fi
   printf '%s\n' "$out" | sed '/^$/d' >"$WORKDIR/codeql"
 }
 
@@ -219,8 +260,14 @@ sensor_actions_pinning() {
 
 count_lines() { local n; n=$(grep -c . "$1" 2>/dev/null); [[ $n =~ ^[0-9]+$ ]] && printf '%s' "$n" || printf '0'; }
 
-print_section() { # <file> <fallback text>
-  if [[ -s $1 ]]; then cat "$1"; else printf '%s\n' "$2"; fi
+print_section() { # <findings file> <fallback text> [note file]
+  if [[ -s $1 ]]; then
+    cat "$1"
+  elif [[ -n ${3:-} && -s $3 ]]; then
+    cat "$3"
+  else
+    printf '%s\n' "$2"
+  fi
 }
 
 render_body() {
@@ -238,9 +285,9 @@ render_body() {
   if [[ -s $WORKDIR/archival ]]; then cat "$WORKDIR/archival"; printf '\n'; fi
 
   printf '#### Dependabot alerts (%s)\n\n' "$dep_n"
-  print_section "$WORKDIR/dependabot" 'No open Dependabot alerts.'
+  print_section "$WORKDIR/dependabot" 'No open Dependabot alerts.' "$WORKDIR/dependabot_note"
   printf '\n#### Code scanning alerts (%s)\n\n' "$code_n"
-  print_section "$WORKDIR/codeql" 'No open code scanning alerts.'
+  print_section "$WORKDIR/codeql" 'No open code scanning alerts.' "$WORKDIR/codeql_note"
   printf '\n#### Dependency audit findings (%s)\n\n' "$loc_n"
   print_section "$WORKDIR/local" 'No vulnerable dependencies detected by local audits.'
   printf '\n#### GitHub Actions pinning (%s)\n\n' "$act_n"
@@ -265,7 +312,8 @@ render_body() {
 [[ $DRY_RUN == 1 ]] || command -v gh >/dev/null 2>&1 || fail "gh CLI is not installed"
 
 WORKDIR=$(mktemp -d) || fail "could not create a temp directory"
-for s in dependabot codeql local actions warnings language archival; do : >"$WORKDIR/$s"; done
+for s in dependabot codeql local actions warnings language archival \
+  dependabot_note codeql_note; do : >"$WORKDIR/$s"; done
 
 if [[ $DRY_RUN != 1 ]]; then
   gh api user --jq .login >/dev/null 2>&1 ||
