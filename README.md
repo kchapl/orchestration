@@ -4,14 +4,35 @@ Cross-repo maintenance automation.
 
 ## Two-phase polyglot health check
 
-`.github/workflows/daily-health-check.yml` runs in two phases, both fanned out
-over every non-archived, non-fork repo the token can see:
+`.github/workflows/daily-health-check.yml` discovers non-archived, non-fork
+repositories, audits them in parallel, and then remediates only repositories
+with an open `automated-health` issue:
 
-1. **`audit-and-raise-issues`** — runs `.github/scripts/audit-repo.sh` against the
-   target checkout and creates or updates one open `automated-health` issue per
-   repo that has actionable findings.
-2. **`resolve-issues`** — hands that issue to OpenHands and opens a draft PR.
-   It skips a repo that has no open health issue.
+1. **`audit-and-raise-issues`** — runs `.github/scripts/audit-repo.sh` against each
+   target checkout and creates or updates an issue when it finds actionable
+   findings.
+2. **`find-remediation`** — checks for open health issues with bounded parallel
+   API calls and batches eligible repositories.
+3. **`resolve-issues`** — runs OpenHands sequentially for each small batch and
+   opens draft PRs. Each batch uses a single runner's Docker daemon, so its
+   OpenHands and runtime images are reused across that batch.
+
+GitHub-hosted runner filesystems and Docker daemons are ephemeral: image layers
+cannot be reused across different jobs or workflow runs. The workflow therefore
+uses per-run batching rather than a cross-run Docker cache (which would be large
+and costly to export/import). The default batch size is three; at most four
+batches run concurrently. Repositories without open issues never enter a batch
+and do not incur checkout, tool setup, or image pulls.
+
+Phase 1 runs independent sensors in two groups, with at most four concurrent
+sensors per repository. Output is collected in a stable order and failures
+remain isolated as warnings.
+
+Phase 2 intentionally does not install host-side Java, Node, Python, or
+Shellcheck: OpenHands runs in its own runtime sandbox and must provide any
+language-specific tools there. Repository clones are shallow; commits created
+by OpenHands are pushed to a new issue branch, so the target's full history is
+not required for remediation.
 
 ### Phase 1 sensors
 

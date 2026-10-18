@@ -113,135 +113,55 @@ jobs:
         run: bash .orchestrator/.github/scripts/render-report.sh audit-records >> "$GITHUB_STEP_SUMMARY"
 
   # ===========================================================================
+  # DISCOVER REMEDIATION: Only schedule repositories with an open health issue.
+  # ===========================================================================
+  find-remediation:
+    needs: [discover-repos, audit-and-raise-issues]
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.batches.outputs.matrix }}
+      has_work: ${{ steps.batches.outputs.has_work }}
+    steps:
+      - name: Checkout health-check tooling
+        uses: actions/checkout@v4
+        with:
+          path: .orchestrator
+
+      - name: Find open issues and group repositories
+        id: batches
+        env:
+          GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
+          REPOS_JSON: ${{ needs.discover-repos.outputs.matrix }}
+          BATCH_SIZE: 3
+          LOOKUP_CONCURRENCY: 8
+        run: bash .orchestrator/.github/scripts/discover-remediation-batches.sh
+
+  # ===========================================================================
   # PHASE 2: OPENHANDS REMEDIATION & DRAFT PR CREATION
   # ===========================================================================
   resolve-issues:
-    needs: [discover-repos, audit-and-raise-issues]
+    needs: [find-remediation]
+    if: needs.find-remediation.outputs.has_work == 'true'
+    name: remediate batch ${{ strategy.job-index }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.discover-repos.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.find-remediation.outputs.matrix) }}
 
     steps:
-      - name: Checkout Target Repository
+      - name: Checkout health-check tooling
         uses: actions/checkout@v4
         with:
-          repository: ${{ matrix.repo }}
-          token: ${{ secrets.ORCHESTRATOR_PAT }}
-          fetch-depth: 0
+          path: .orchestrator
 
-      # Fix: Removed cache: 'sbt' so setup-java doesn't fail on non-Scala repos
-      - name: Setup Java/Scala
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Setup Node/TypeScript
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Install Shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Fetch Issue Context & Execute OpenHands
+      - name: Run batched OpenHands remediations
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TARGET_REPO: ${{ matrix.repo }}
-        run: |
-          # Fetch open automated-health issue
-          ISSUE_DATA=$(gh issue list --repo "$TARGET_REPO" --label "automated-health" --state "open" --json number,body --jq '.[0]' 2>/dev/null || echo "")
-          
-          if [[ -z "$ISSUE_DATA" || "$ISSUE_DATA" == "null" ]]; then
-            echo "No open health issue found for $TARGET_REPO. Skipping OpenHands execution."
-            exit 0
-          fi
+          REMEDIATION_BATCH: ${{ matrix.batch }}
+        run: bash .orchestrator/.github/scripts/remediate-batch.sh
 
-          ISSUE_NUM=$(echo "$ISSUE_DATA" | jq -r '.number // empty')
-          ISSUE_BODY=$(echo "$ISSUE_DATA" | jq -r '.body // empty')
-
-          if [[ -z "$ISSUE_NUM" ]]; then
-            echo "Could not parse valid issue number for $TARGET_REPO. Skipping."
-            exit 0
-          fi
-
-          BRANCH_NAME="health/fix-issue-$ISSUE_NUM"
-
-          # Idempotence: skip if PR branch already exists on remote
-          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
-            echo "Branch $BRANCH_NAME already exists on remote. Skipping execution."
-            exit 0
-          fi
-
-          git checkout -b "$BRANCH_NAME"
-          echo "$ISSUE_BODY" > .issue-context.md
-
-          # Run OpenHands in headless mode using Gemini 3.7 Flash
-          # The agent runs in a sandbox container, so the app container needs the
-          # host Docker socket, and SANDBOX_VOLUMES must name the *host* workspace
-          # path: "$(pwd)" is /workspace inside the container and would mount an
-          # empty directory into the sandbox.
-          # The app also writes its config (JWT secret) to /.openhands as the
-          # sandbox uid, so that path has to be a writable host directory.
-          mkdir -p "$HOME/.openhands"
-          docker run --rm \
-            -e LLM_API_KEY="$GEMINI_API_KEY" \
-            -e LLM_MODEL="gemini/gemini-3.7-flash" \
-            -e SANDBOX_USER_ID="$(id -u)" \
-            -e SANDBOX_VOLUMES="${{ github.workspace }}:/workspace:rw" \
-            -e SANDBOX_RUNTIME_CONTAINER_IMAGE=ghcr.io/all-hands-ai/runtime:0.59-nikolaik \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$HOME/.openhands:/.openhands" \
-            -v "$(pwd):/workspace" \
-            --add-host host.docker.internal:host-gateway \
-            ghcr.io/all-hands-ai/openhands@sha256:00968de77a7b36546413e1f3b5c6b4e2c387d19ade54de7926e10f5b3d265fa6 \
-            python -m openhands.core.main \
-              -t "Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, dependency updates, and GitHub Actions workflow issues mentioned. If workflows are flagged, update action versions in .github/workflows/*.yml to the latest releases. Do not hand-edit .github/workflows/actions.lock: the pipeline regenerates it with 'gh actions-lock' after your edits. If the repo has no lockfile, use full 40-character commit SHAs for any action reference you add or change. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run native test suites ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify cleanly."
-
-          rm -f .issue-context.md
-
-          # Keep an existing workflow lockfile in sync with the workflows OpenHands
-          # edited. Repos without a lockfile are left alone: adopting the lockfile is
-          # a policy decision, not a per-PR side effect.
-          if [ -f .github/workflows/actions.lock ] && \
-             git status --porcelain -- .github/workflows | grep -qE '\.ya?ml$'; then
-            echo "Regenerating .github/workflows/actions.lock..."
-            gh extension install github/gh-actions-lock >/dev/null 2>&1 || true
-            gh actions-lock || echo "::warning::gh actions-lock failed; the lockfile may be stale"
-          fi
-
-          # Check if OpenHands generated modifications
-          if git status --porcelain | grep -q .; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add .
-            git commit -m "fix(health): automated OpenHands resolution for issue #$ISSUE_NUM"
-            git push origin "$BRANCH_NAME"
-
-            gh pr create \
-              --repo "$TARGET_REPO" \
-              --head "$BRANCH_NAME" \
-              --title "🤖 [PR] Resolve Health Issue #$ISSUE_NUM" \
-              --body "### Automated Maintenance Fixes
-            Generated by OpenHands using **Gemini 3.7 Flash**.
-
-            **Closes #$ISSUE_NUM**
-
-            **Verification Status:**
-            - [x] Examined requirements from Issue #$ISSUE_NUM
-            - [x] Audited and updated GitHub Actions workflows
-            - [x] Applied safe dependency and code vulnerability patches
-            - [x] Verified native build and unit test execution
-
-            Please inspect the diff and approve." \
-              --draft
-          else
-            echo "OpenHands completed without generating code diffs for Issue #$ISSUE_NUM."
-          fi
+    # Each standard GitHub-hosted runner has its own Docker daemon. Batching
+    # lets that daemon reuse both images across the repositories in its batch;
+    # image storage does not persist between separate workflow jobs or runs.
+    max-parallel: 4

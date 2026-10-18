@@ -50,6 +50,9 @@ fail() { printf '::error::%s\n' "$*"; printf 'error: %s\n' "$*" >&2; exit 1; }
 # enabled), anything else = genuine sensor failure.
 run_sensor() {
   local name=$1 fn=$2 rc=0 err
+  local warning_key=${1// /-}
+  warning_key=${warning_key//\//-}
+  local warning_file="$WORKDIR/warning-$warning_key"
   err=$("$fn" 2>&1 >/dev/null) || rc=$?
   if ((rc == 0)); then
     log "  ok    $name"
@@ -61,7 +64,7 @@ run_sensor() {
     return 0
   fi
   warn "$name sensor failed: ${err:-no details}"
-  printf -- '- **%s**: sensor failed — %s\n' "$name" "${err:-no details}" >>"$WORKDIR/warnings"
+  printf -- '- **%s**: sensor failed — %s\n' "$name" "${err:-no details}" >"$warning_file"
 }
 
 capitalize() { local first=${1:0:1}; printf '%s%s' "${first^^}" "${1:1}"; }
@@ -225,7 +228,7 @@ sensor_npm_audit() {
     printf 'could not render npm audit findings\n' >&2
     return 1
   fi
-  [[ -n $rendered ]] && printf '%s\n' "$rendered" >>"$WORKDIR/local"
+  [[ -n $rendered ]] && printf '%s\n' "$rendered" >>"$WORKDIR/local-npm"
   return 0
 }
 
@@ -258,7 +261,7 @@ sensor_pip_audit() {
       printf 'could not render pip-audit findings for %s\n' "${f#"$TARGET_DIR"/}" >&2
       return 1
     fi
-    [[ -n $rendered ]] && printf '%s\n' "$rendered" >>"$WORKDIR/local"
+    [[ -n $rendered ]] && printf '%s\n' "$rendered" >>"$WORKDIR/local-pip"
   done
   return 0
 }
@@ -390,8 +393,12 @@ render_body() {
 [[ $DRY_RUN == 1 ]] || command -v gh >/dev/null 2>&1 || fail "gh CLI is not installed"
 
 WORKDIR=$(mktemp -d) || fail "could not create a temp directory"
-for s in dependabot codeql local actions warnings language archival \
+for s in dependabot codeql local local-npm local-pip actions warnings language archival \
   dependabot_note codeql_note; do : >"$WORKDIR/$s"; done
+for s in dependabot codeql language archival npm-audit pip-audit actions-pinning; do
+  : >"$WORKDIR/log-$s"
+  : >"$WORKDIR/warning-$s"
+done
 # Inventory state surfaced in the run summary, kept separate from findings.
 printf 'unknown' >"$WORKDIR/code_scanning"
 printf 'unknown' >"$WORKDIR/archival_state"
@@ -405,13 +412,31 @@ if [[ $DRY_RUN != 1 ]]; then
 fi
 
 log "Auditing $REPO (checkout: $TARGET_DIR)"
-run_sensor "dependabot" sensor_dependabot
-run_sensor "codeql" sensor_codeql
-run_sensor "language" sensor_language
-run_sensor "archival" sensor_archival
-run_sensor "npm audit" sensor_npm_audit
-run_sensor "pip-audit" sensor_pip_audit
-run_sensor "actions pinning" sensor_actions_pinning
+# Run no more than four sensors at once to reduce wall time without creating
+# unbounded API requests. Each sensor has isolated output files.
+run_sensor "dependabot" sensor_dependabot >"$WORKDIR/log-dependabot" 2>&1 & pid_dependabot=$!
+run_sensor "codeql" sensor_codeql >"$WORKDIR/log-codeql" 2>&1 & pid_codeql=$!
+run_sensor "language" sensor_language >"$WORKDIR/log-language" 2>&1 & pid_language=$!
+run_sensor "archival" sensor_archival >"$WORKDIR/log-archival" 2>&1 & pid_archival=$!
+wait "$pid_dependabot" || true
+wait "$pid_codeql" || true
+wait "$pid_language" || true
+wait "$pid_archival" || true
+
+run_sensor "npm audit" sensor_npm_audit >"$WORKDIR/log-npm-audit" 2>&1 & pid_npm_audit=$!
+run_sensor "pip-audit" sensor_pip_audit >"$WORKDIR/log-pip-audit" 2>&1 & pid_pip_audit=$!
+run_sensor "actions pinning" sensor_actions_pinning >"$WORKDIR/log-actions-pinning" 2>&1 & pid_actions=$!
+wait "$pid_npm_audit" || true
+wait "$pid_pip_audit" || true
+wait "$pid_actions" || true
+
+for s in dependabot codeql language archival npm-audit pip-audit actions-pinning; do
+  cat "$WORKDIR/log-$s"
+done
+for s in dependabot codeql language archival npm-audit pip-audit actions-pinning; do
+  cat "$WORKDIR/warning-$s" >>"$WORKDIR/warnings"
+done
+cat "$WORKDIR/local-npm" "$WORKDIR/local-pip" >"$WORKDIR/local"
 
 BODY=$(render_body)
 FINDINGS=$(( $(count_lines "$WORKDIR/dependabot") + $(count_lines "$WORKDIR/codeql") \
