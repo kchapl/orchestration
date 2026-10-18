@@ -184,15 +184,33 @@ jobs:
           echo "$ISSUE_BODY" > .issue-context.md
 
           # Run OpenHands in headless mode using Gemini 3.7 Flash
+          # The agent runs in a sandbox container, so the app container needs the
+          # host Docker socket, and SANDBOX_VOLUMES must name the *host* workspace
+          # path: "$(pwd)" is /workspace inside the container and would mount an
+          # empty directory into the sandbox.
           docker run --rm \
             -e LLM_API_KEY="$GEMINI_API_KEY" \
             -e LLM_MODEL="gemini/gemini-3.7-flash" \
+            -e SANDBOX_USER_ID="$(id -u)" \
+            -e SANDBOX_VOLUMES="${{ github.workspace }}:/workspace:rw" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$(pwd):/workspace" \
-            ghcr.io/all-hands-ai/openhands:latest \
+            --add-host host.docker.internal:host-gateway \
+            ghcr.io/all-hands-ai/openhands@sha256:00968de77a7b36546413e1f3b5c6b4e2c387d19ade54de7926e10f5b3d265fa6 \
             python -m openhands.core.main \
-              -t "Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, dependency updates, and GitHub Actions workflow issues mentioned. If workflows are flagged, update action versions in .github/workflows/*.yml to the latest releases and ensure proper commit SHA pinning or lockfile generation. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run native test suites ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify cleanly."
+              -t "Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, dependency updates, and GitHub Actions workflow issues mentioned. If workflows are flagged, update action versions in .github/workflows/*.yml to the latest releases. Do not hand-edit .github/workflows/actions.lock: the pipeline regenerates it with 'gh actions-lock' after your edits. If the repo has no lockfile, use full 40-character commit SHAs for any action reference you add or change. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run native test suites ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify cleanly."
 
           rm -f .issue-context.md
+
+          # Keep an existing workflow lockfile in sync with the workflows OpenHands
+          # edited. Repos without a lockfile are left alone: adopting the lockfile is
+          # a policy decision, not a per-PR side effect.
+          if [ -f .github/workflows/actions.lock ] && \
+             git status --porcelain -- .github/workflows | grep -qE '\.ya?ml$'; then
+            echo "Regenerating .github/workflows/actions.lock..."
+            gh extension install github/gh-actions-lock >/dev/null 2>&1 || true
+            gh actions-lock || echo "::warning::gh actions-lock failed; the lockfile may be stale"
+          fi
 
           # Check if OpenHands generated modifications
           if git status --porcelain | grep -q .; then
