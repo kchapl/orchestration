@@ -196,6 +196,7 @@ jobs:
             -e LLM_MODEL="gemini/gemini-3.7-flash" \
             -e SANDBOX_USER_ID="$(id -u)" \
             -e SANDBOX_VOLUMES="${{ github.workspace }}:/workspace:rw" \
+            -e SANDBOX_RUNTIME_CONTAINER_IMAGE=ghcr.io/all-hands-ai/runtime:0.59-nikolaik \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$HOME/.openhands:/.openhands" \
             -v "$(pwd):/workspace" \
