@@ -1,1 +1,51 @@
 # orchestration
+
+Cross-repo maintenance automation.
+
+## Two-phase polyglot health check
+
+`.github/workflows/daily-health-check.yml` runs in two phases, both fanned out
+over every non-archived, non-fork repo the token can see:
+
+1. **`audit-and-raise-issues`** — runs `.github/scripts/audit-repo.sh` against the
+   target checkout and creates or updates one open `automated-health` issue per
+   repo that has actionable findings.
+2. **`resolve-issues`** — hands that issue to OpenHands and opens a draft PR.
+   It skips a repo that has no open health issue.
+
+### Phase 1 sensors
+
+| Sensor | Source |
+| --- | --- |
+| Dependabot alerts | `repos/{repo}/dependabot/alerts` |
+| Code scanning alerts | `repos/{repo}/code-scanning/alerts` |
+| npm advisories | `npm audit --json` (requires a lockfile) |
+| Python advisories | `pip-audit -r requirements*.txt` |
+| GitHub Actions pinning | `uses:` refs that are not 40-char commit SHAs |
+| Primary language | `repos/{repo}` metadata |
+| Archival candidate | no human-authored commit in over a year |
+
+Every sensor runs in isolation: a sensor that fails (feature disabled, missing
+tool, API error) is reported as a warning and in the issue body, and the other
+sensors still run. Findings — not sensor health — decide whether an issue is
+raised. An authentication failure is the one hard error, so a broken token can
+never produce a green "all clean" run.
+
+### Running the audit locally
+
+`gh` must be authenticated (`GH_TOKEN` or `gh auth login`); `jq` is required.
+
+```sh
+# Audit the current checkout and print the issue body without writing anything
+REPO=owner/name DRY_RUN=1 ./.github/scripts/audit-repo.sh
+
+# Audit another checkout, creating/updating the issue if findings exist
+REPO=owner/name TARGET_DIR=/path/to/checkout ./.github/scripts/audit-repo.sh
+```
+
+### Required secrets
+
+| Secret | Purpose |
+| --- | --- |
+| `ORCHESTRATOR_PAT` | repo discovery, issue writes, checkouts, PR pushes |
+| `GEMINI_API_KEY` | OpenHands model access in phase 2 |

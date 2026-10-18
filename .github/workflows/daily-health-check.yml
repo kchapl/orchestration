@@ -5,6 +5,9 @@ on:
    # - cron: '0 8 * * *' # Daily at 08:00 UTC
   workflow_dispatch: # Allows manual run from GitHub Actions UI
 
+permissions:
+  contents: read
+
 jobs:
   # ===========================================================================
   # DISCOVERY: Fetch Non-Archived Repositories
@@ -19,14 +22,33 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
         run: |
-          # Fetch all active, non-archived repos for authenticated user/org
-          REPOS=$(gh api user/repos --paginate --jq '[.[] | select(.archived == false and .fork == false) | .full_name]')
-          echo "matrix={\"repo\": $REPOS}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          # --jq '.[]' emits one line per repo, which keeps --paginate output valid.
+          REPOS=$(gh api user/repos --paginate \
+            --jq '.[] | select(.archived == false and .fork == false) | .full_name')
+          MATRIX=$(jq -nc --arg repos "$REPOS" '{
+            repo: ($repos | split("\n") | map(select(length > 0)))
+          }')
+          COUNT=$(jq '.repo | length' <<<"$MATRIX")
+          echo "Discovered $COUNT repositories"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No auditable repositories discovered; refusing to run an empty matrix"
+            exit 1
+          fi
+          if [ "$COUNT" -gt 256 ]; then
+            echo "::warning::Truncating matrix to 256 repositories (GitHub job limit)"
+            MATRIX=$(jq -c '.repo |= .[:256]' <<<"$MATRIX")
+            COUNT=256
+          fi
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
   # ===========================================================================
   # PHASE 1: AUDIT & ISSUE CREATION
   # ===========================================================================
   audit-and-raise-issues:
+    name: audit ${{ matrix.repo }}
     needs: discover-repos
     runs-on: ubuntu-latest
     strategy:
@@ -34,136 +56,26 @@ jobs:
       matrix: ${{ fromJson(needs.discover-repos.outputs.matrix) }}
 
     steps:
-      - name: Checkout Repository
+      # The audit logic lives in this repo so it can be run and tested locally.
+      - name: Checkout health-check tooling
+        uses: actions/checkout@v4
+        with:
+          path: .orchestrator
+
+      - name: Checkout target repository
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
           token: ${{ secrets.ORCHESTRATOR_PAT }}
+          path: target
 
-      - name: Setup Node (for npm audit)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install Shellcheck & Auditing Tools
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Execute Audit Sensors & Create/Update Issue
+      - name: Run audit sensors and raise issue
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
           REPO: ${{ matrix.repo }}
-        run: |
-          # 1. Fetch Dependabot and CodeQL Security Alerts via GitHub API
-          DEPENDABOT_ALERTS=$(gh api "repos/$REPO/dependabot/alerts?state=open" --jq '.[] | "- **[\(.security_advisory.severity)]** \(.security_vulnerability.package.name): \(.security_advisory.summary)"' 2>/dev/null || echo "")
-          CODEQL_ALERTS=$(gh api "repos/$REPO/code-scanning/alerts?state=open" --jq '.[] | "- **CodeQL Rule \(.rule.id)**: \(.rule.description) in \(.most_recent_instance.location.path)"' 2>/dev/null || echo "")
+          TARGET_DIR: ${{ github.workspace }}/target
+        run: bash .orchestrator/.github/scripts/audit-repo.sh
 
-          # 2. Language Validation Check (Allowed: Python, Shell, TypeScript, Scala)
-          PRIMARY_LANG=$(gh api "repos/$REPO" --jq '.language // "Unspecified"')
-
-          UNSUPPORTED_LANG_NOTICE=""
-          case "$PRIMARY_LANG" in
-            Python|Shell|TypeScript|Scala|Unspecified)
-              ;;
-            *)
-              UNSUPPORTED_LANG_NOTICE="> **⚠️ Unsupported Language Alert:** Primary language detected is **${PRIMARY_LANG}**, which is outside supported set (*Python, Shell, TypeScript, Scala*). OpenHands will perform file-based fixes, but native tests may require custom toolchain setup.\n"
-              ;;
-          esac
-
-          # 3. Local Linter & Vulnerability Checks
-          LOCAL_FINDINGS=""
-          if [ -f "package.json" ]; then
-            NPM_AUDIT=$(npm audit --json 2>/dev/null | jq -r '.metadata.vulnerabilities.total // 0' || echo "0")
-            if echo "$NPM_AUDIT" | grep -qE '^[0-9]+$' && [ "$NPM_AUDIT" -gt 0 ]; then
-              LOCAL_FINDINGS+="- **npm audit** flagged $NPM_AUDIT vulnerable dependencies.\n"
-            fi
-          fi
-
-          if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
-            pip install pip-audit 2>/dev/null || true
-            PIP_AUDIT=$(pip-audit --format=json 2>/dev/null | jq '. | length // 0' || echo "0")
-            if echo "$PIP_AUDIT" | grep -qE '^[0-9]+$' && [ "$PIP_AUDIT" -gt 0 ]; then
-              LOCAL_FINDINGS+="- **pip-audit** flagged $PIP_AUDIT vulnerable Python packages.\n"
-            fi
-          fi
-
-          # 4. GitHub Actions Workflows & Lockfile Sensor
-          ACTIONS_FINDINGS=""
-          if [ -d ".github/workflows" ]; then
-            UNPINNED_COUNT=$(grep -rE "uses:\s*[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+@" .github/workflows/ | grep -v "@[a-f0-9]\{40\}" | wc -l || echo "0")
-            if [ "$UNPINNED_COUNT" -gt 0 ]; then
-              ACTIONS_FINDINGS+="- Unpinned or outdated GitHub Actions found in \`.github/workflows/\` ($UNPINNED_COUNT step(s) not using exact commit SHAs).\n"
-            fi
-          fi
-
-          # 5. Archival Candidate Check (> 1 Year without human commit)
-          CUTOFF_DATE=$(date -d '1 year ago' +%s)
-          LAST_HUMAN_COMMIT_RAW=$(gh api "repos/$REPO/commits?per_page=20" --jq '
-            [.[] | select(.author.type == "User" and (.author.login | contains("bot") | not))] 
-            | .[0].commit.committer.date
-          ' 2>/dev/null || echo "")
-
-          ARCHIVAL_NOTICE=""
-          IS_INACTIVE="false"
-
-          if [ -z "$LAST_HUMAN_COMMIT_RAW" ] \vert{}\vert{} [ "$LAST_HUMAN_COMMIT_RAW" = "null" ]; then
-            IS_INACTIVE="true"
-          else
-            COMMIT_TS=$(date -d "$LAST_HUMAN_COMMIT_RAW" +%s 2>/dev/null || echo "0")
-            if [ "$COMMIT_TS" -gt 0 ] && [ "$COMMIT_TS" -lt "$CUTOFF_DATE" ]; then
-              IS_INACTIVE="true"
-            fi
-          fi
-
-          if [ "$IS_INACTIVE" = "true" ]; then
-            ARCHIVAL_NOTICE="> **📦 Archival Candidate Notice:** No human author commit detected in over 1 year (Last human commit: ${LAST_HUMAN_COMMIT_RAW:-"None in recent history"}). Consider archiving this repo (\`gh repo archive $REPO\`).\n"
-          fi
-
-          # 6. Create or Update GitHub Issue if ANY actionable findings exist
-          if [ -n "$DEPENDABOT_ALERTS" ] \vert{}\vert{} [ -n "$CODEQL_ALERTS" ] || [ -n "$LOCAL_FINDINGS" ] \vert{}\vert{} [ -n "$ACTIONS_FINDINGS" ] || [ -n "$ARCHIVAL_NOTICE" ] \vert{}\vert{} [ -n "$UNSUPPORTED_LANG_NOTICE" ]; then
-            echo "Findings detected for $REPO. Ensuring 'automated-health' label exists..."
-            
-            gh label create "automated-health" \
-              --repo "$REPO" \
-              --description "Tracked by automated health-check pipeline" \
-              --color "0E8A16" \
-              --force 2>/dev/null || true
-
-            EXISTING_ISSUE=$(gh issue list --repo "$REPO" --label "automated-health" --state "open" --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
-
-            ISSUE_BODY="### 🛡️ Automated Repository Health Audit Findings
-
-            ${UNSUPPORTED_LANG_NOTICE}${ARCHIVAL_NOTICE}
-
-            #### GitHub Actions CI/CD Findings:
-            ${ACTIONS_FINDINGS:-"All GitHub Actions workflows are up to date and locked."}
-
-            #### Dependabot Vulnerability Advisories:
-            ${DEPENDABOT_ALERTS:-"No open Dependabot alerts."}
-
-            #### CodeQL Static Analysis Alerts:
-            ${CODEQL_ALERTS:-"No open CodeQL alerts."}
-
-            #### Local Toolchain & Security Findings:
-            ${LOCAL_FINDINGS:-"No local package issues."}
-
-            ---
-            *Generated automatically. OpenHands (via Gemini 3.7 Flash) will process open findings in Phase 2 unless this issue is closed or archived.*"
-
-            if [ -z "$EXISTING_ISSUE" ]; then
-              echo "Opening new health issue on $REPO..."
-              gh issue create \
-                --repo "$REPO" \
-                --title "🛡️ [Health Audit] Security Vulnerabilities & Dependency Maintenance" \
-                --body "$ISSUE_BODY" \
-                --label "automated-health"
-            else
-              echo "Updating existing health issue #$EXISTING_ISSUE on$REPO..."
-              gh issue edit "$EXISTING_ISSUE" --repo "$REPO" --body "$ISSUE_BODY"
-            fi
-          else
-            echo "No actionable findings for $REPO. No issue raised."
-          fi
-          
   # ===========================================================================
   # PHASE 2: OPENHANDS REMEDIATION & DRAFT PR CREATION
   # ===========================================================================
