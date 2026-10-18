@@ -21,9 +21,15 @@ over every non-archived, non-fork repo the token can see:
 | Code scanning alerts | `repos/{repo}/code-scanning/alerts` |
 | npm advisories | `npm audit --json` (requires a lockfile) |
 | Python advisories | `pip-audit -r requirements*.txt` |
-| GitHub Actions pinning | `uses:` refs that are not 40-char commit SHAs |
+| GitHub Actions pinning | `uses:` refs that are neither a 40-char commit SHA nor covered by `.github/workflows/actions.lock` |
 | Primary language | `repos/{repo}` metadata |
 | Archival candidate | no human-authored commit in over a year |
+
+Repos that use the official workflow lockfile are not nagged: a workflow listed
+in `.github/workflows/actions.lock` counts as pinned when every `uses:` ref it
+contains has a pin entry, because Actions executes the locked commit. A ref
+missing from the lockfile, or a workflow that has not been onboarded at all, is
+still reported.
 
 Every sensor runs in isolation: a sensor that fails (missing tool, API error) is
 reported as a warning and in the issue body, and the other sensors still run.

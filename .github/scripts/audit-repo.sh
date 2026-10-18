@@ -263,10 +263,39 @@ sensor_pip_audit() {
   return 0
 }
 
-# Flags "uses: owner/action@ref" entries that are not pinned to a commit SHA.
+# Flatten .github/workflows/actions.lock into "<workflow path>\t<pin key>" lines,
+# plus a bare "<workflow path>\t" line for every onboarded workflow.
+# Pin keys are OWNER/REPO@REF, so a uses: owner/repo/sub@ref maps onto one.
+lockfile_map() {
+  awk '
+    /^workflows:[[:space:]]*$/ { in_wf = 1; wf = ""; next }
+    /^[^[:space:]]/ { in_wf = 0 }
+    in_wf && /^  [^[:space:]-][^:]*:[[:space:]]*$/ {
+      wf = $0
+      sub(/:[[:space:]]*$/, "", wf)
+      wf = substr(wf, 3)
+      print wf "\t"
+      next
+    }
+    in_wf && /^[[:space:]]+-[[:space:]]+/ {
+      pin = $0
+      sub(/^[[:space:]]+-[[:space:]]+/, "", pin)
+      print wf "\t" pin
+    }
+  ' "$1"
+}
+
+# Flags "uses:" references that are not pinned: either a full commit SHA, or a
+# ref covered by the official workflow lockfile (.github/workflows/actions.lock).
 sensor_actions_pinning() {
   local wf_dir="$TARGET_DIR/.github/workflows" hit file rest lineno text uses ref reason
+  local rel key lock_map=""
   [[ -d $wf_dir ]] || return 0
+
+  if [[ -f $wf_dir/actions.lock ]]; then
+    lock_map="$WORKDIR/lockfile-map"
+    lockfile_map "$wf_dir/actions.lock" >"$lock_map"
+  fi
 
   while IFS= read -r hit; do
     file=${hit%%:*}
@@ -276,17 +305,29 @@ sensor_actions_pinning() {
     uses=${text#*uses:}
     uses=${uses%%#*}
     uses=${uses//[[:space:]]/}
-    [[ -z $uses || $uses == ./* || $uses == docker://* ]] && continue
+    [[ -z $uses || $uses == ./* || $uses == docker://* || $uses == '$/'* ]] && continue
     # shellcheck disable=SC2016 # literal GitHub Actions expression syntax
     [[ $uses == *'${{'* ]] && continue
-    if [[ $uses != *@* ]]; then
+
+    rel=${file#"$TARGET_DIR"/}
+    if [[ -n $lock_map ]] && grep -Fxq "$rel"$'\t' "$lock_map"; then
+      # Onboarded workflow: the runner executes the locked commit, so the ref in
+      # the workflow only has to be present in the lockfile for this workflow.
+      key=$(printf '%s' "${uses%@*}" | cut -d/ -f1-2)"@""${uses##*@}"
+      grep -Fxq "$rel"$'\t'"$key" "$lock_map" && continue
+      reason="not in actions.lock for this workflow (run 'gh actions-lock')"
+    elif [[ $uses != *@* ]]; then
       reason="no ref specified"
     else
       ref=${uses##*@}
       [[ $ref =~ ^[0-9a-f]{40}$ ]] && continue
-      reason="ref '${ref}' is not a commit SHA"
+      if [[ -n $lock_map ]]; then
+        reason="ref '${ref}' is not a commit SHA and the workflow is not onboarded to actions.lock"
+      else
+        reason="ref '${ref}' is not a commit SHA"
+      fi
     fi
-    printf -- "- \`%s:%s\` — \`%s\` (%s)\n" "${file#"$TARGET_DIR"/}" "$lineno" "$uses" "$reason" \
+    printf -- "- \`%s:%s\` — \`%s\` (%s)\n" "$rel" "$lineno" "$uses" "$reason" \
       >>"$WORKDIR/actions"
   done < <(grep -rInE '^[[:space:]]*(-[[:space:]]+)?uses:' "$wf_dir" 2>/dev/null)
 }
