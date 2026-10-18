@@ -59,18 +59,21 @@ jobs:
 
           # 2. Language Validation Check (Allowed: Python, Shell, TypeScript, Scala)
           PRIMARY_LANG=$(gh api "repos/$REPO" --jq '.language // "Unspecified"')
-          SUPPORTED_REGEX="^(Python|Shell|TypeScript|Scala|Unspecified)$"
 
           UNSUPPORTED_LANG_NOTICE=""
-          if [[ ! "$PRIMARY_LANG" =~ $SUPPORTED_REGEX ]]; then
-            UNSUPPORTED_LANG_NOTICE="> **⚠️ Unsupported Language Alert:** Primary language detected is **${PRIMARY_LANG}**, which is outside supported set (*Python, Shell, TypeScript, Scala*). OpenHands will perform file-based fixes, but native tests may require custom toolchain setup.\n"
-          fi
+          case "$PRIMARY_LANG" in
+            Python|Shell|TypeScript|Scala|Unspecified)
+              ;;
+            *)
+              UNSUPPORTED_LANG_NOTICE="> **⚠️ Unsupported Language Alert:** Primary language detected is **${PRIMARY_LANG}**, which is outside supported set (*Python, Shell, TypeScript, Scala*). OpenHands will perform file-based fixes, but native tests may require custom toolchain setup.\n"
+              ;;
+          esac
 
           # 3. Local Linter & Vulnerability Checks
           LOCAL_FINDINGS=""
           if [ -f "package.json" ]; then
             NPM_AUDIT=$(npm audit --json 2>/dev/null | jq -r '.metadata.vulnerabilities.total // 0' || echo "0")
-            if [[ "$NPM_AUDIT" =~ ^[0-9]+$ ]] && [ "$NPM_AUDIT" -gt 0 ]; then
+            if echo "$NPM_AUDIT" | grep -qE '^[0-9]+$' && [ "$NPM_AUDIT" -gt 0 ]; then
               LOCAL_FINDINGS+="- **npm audit** flagged $NPM_AUDIT vulnerable dependencies.\n"
             fi
           fi
@@ -78,12 +81,12 @@ jobs:
           if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
             pip install pip-audit 2>/dev/null || true
             PIP_AUDIT=$(pip-audit --format=json 2>/dev/null | jq '. | length // 0' || echo "0")
-            if [[ "$PIP_AUDIT" =~ ^[0-9]+$ ]] && [ "$PIP_AUDIT" -gt 0 ]; then
+            if echo "$PIP_AUDIT" | grep -qE '^[0-9]+$' && [ "$PIP_AUDIT" -gt 0 ]; then
               LOCAL_FINDINGS+="- **pip-audit** flagged $PIP_AUDIT vulnerable Python packages.\n"
             fi
           fi
 
-          # 4. GitHub Actions Workflows & Lockfile Sensor (Safely handle multiline grep)
+          # 4. GitHub Actions Workflows & Lockfile Sensor
           ACTIONS_FINDINGS=""
           if [ -d ".github/workflows" ]; then
             UNPINNED_COUNT=$(grep -rE "uses:\s*[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+@" .github/workflows/ | grep -v "@[a-f0-9]\{40\}" | wc -l || echo "0")
@@ -102,7 +105,7 @@ jobs:
           ARCHIVAL_NOTICE=""
           IS_INACTIVE="false"
 
-          if [[ -z "$LAST_HUMAN_COMMIT_RAW" \vert{}\vert{} "$LAST_HUMAN_COMMIT_RAW" == "null" ]]; then
+          if [ -z "$LAST_HUMAN_COMMIT_RAW" ] \vert{}\vert{} [ "$LAST_HUMAN_COMMIT_RAW" = "null" ]; then
             IS_INACTIVE="true"
           else
             COMMIT_TS=$(date -d "$LAST_HUMAN_COMMIT_RAW" +%s 2>/dev/null || echo "0")
@@ -116,7 +119,7 @@ jobs:
           fi
 
           # 6. Create or Update GitHub Issue if ANY actionable findings exist
-          if [[ -n "$DEPENDABOT_ALERTS" \vert{}\vert{} -n "$CODEQL_ALERTS" || -n "$LOCAL_FINDINGS" \vert{}\vert{} -n "$ACTIONS_FINDINGS" || -n "$ARCHIVAL_NOTICE" \vert{}\vert{} -n "$UNSUPPORTED_LANG_NOTICE" ]]; then
+          if [ -n "$DEPENDABOT_ALERTS" ] \vert{}\vert{} [ -n "$CODEQL_ALERTS" ] || [ -n "$LOCAL_FINDINGS" ] \vert{}\vert{} [ -n "$ACTIONS_FINDINGS" ] || [ -n "$ARCHIVAL_NOTICE" ] \vert{}\vert{} [ -n "$UNSUPPORTED_LANG_NOTICE" ]; then
             echo "Findings detected for $REPO. Ensuring 'automated-health' label exists..."
             
             gh label create "automated-health" \
@@ -146,7 +149,7 @@ jobs:
             ---
             *Generated automatically. OpenHands (via Gemini 3.7 Flash) will process open findings in Phase 2 unless this issue is closed or archived.*"
 
-            if [[ -z "$EXISTING_ISSUE" ]]; then
+            if [ -z "$EXISTING_ISSUE" ]; then
               echo "Opening new health issue on $REPO..."
               gh issue create \
                 --repo "$REPO" \
