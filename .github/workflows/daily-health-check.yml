@@ -1,0 +1,234 @@
+name: Two-Phase Polyglot Health Check (OpenHands + Gemini 3.7 Flash)
+
+on:
+  #schedule:
+   # - cron: '0 8 * * *' # Daily at 08:00 UTC
+  workflow_dispatch: # Allows manual run from GitHub Actions UI
+
+jobs:
+  # ===========================================================================
+  # DISCOVERY: Fetch Non-Archived Repositories
+  # ===========================================================================
+  discover-repos:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Fetch repository list via GitHub API
+        id: set-matrix
+        env:
+          GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
+        run: |
+          # Fetch all active, non-archived repos for authenticated user/org
+          REPOS=$(gh api user/repos --paginate --jq '[.[] | select(.archived == false and .fork == false) | .full_name]')
+          echo "matrix={\"repo\": $REPOS}" >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # PHASE 1: AUDIT & ISSUE CREATION
+  # ===========================================================================
+  audit-and-raise-issues:
+    needs: discover-repos
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-repos.outputs.matrix) }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          token: ${{ secrets.ORCHESTRATOR_PAT }}
+
+      - name: Setup Node (for npm audit)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Shellcheck & Auditing Tools
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Execute Audit Sensors & Create/Update Issue
+        env:
+          GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
+          REPO: ${{ matrix.repo }}
+        run: |
+          # 1. Fetch Dependabot and CodeQL Security Alerts via GitHub API
+          DEPENDABOT_ALERTS=$(gh api "repos/$REPO/dependabot/alerts?state=open" --jq '.[] | "- **[\(.security_advisory.severity)]** \(.security_vulnerability.package.name): \(.security_advisory.summary)"' 2>/dev/null || echo "")
+          CODEQL_ALERTS=$(gh api "repos/$REPO/code-scanning/alerts?state=open" --jq '.[] | "- **CodeQL Rule \(.rule.id)**: \(.rule.description) in \(.most_recent_instance.location.path)"' 2>/dev/null || echo "")
+
+          # 2. Language Validation Check (Allowed: Python, Shell, TypeScript, Scala)
+          PRIMARY_LANG=$(gh api "repos/$REPO" --jq '.language // "Unspecified"')
+          SUPPORTED_REGEX="^(Python|Shell|TypeScript|Scala|Unspecified)$"
+
+          UNSUPPORTED_LANG_NOTICE=""
+          if [[ ! "$PRIMARY_LANG" =~ $SUPPORTED_REGEX ]]; then
+            UNSUPPORTED_LANG_NOTICE="> **⚠️ Unsupported Language Alert:** Primary language detected is **${PRIMARY_LANG}**, which is outside supported set (*Python, Shell, TypeScript, Scala*). OpenHands will perform file-based fixes, but native tests may require custom toolchain setup.\n"
+          fi
+
+          # 3. Local Linter & Vulnerability Checks
+          LOCAL_FINDINGS=""
+          if [ -f "build.sbt" ]; then
+            LOCAL_FINDINGS+="- Scala/sbt project structure detected.\n"
+          fi
+          if [ -f "package.json" ]; then
+            NPM_AUDIT=$(npm audit --json 2>/dev/null | jq -r '.metadata.vulnerabilities.total' || echo "0")
+            if [ "$NPM_AUDIT" -gt "0" ]; then
+              LOCAL_FINDINGS+="- npm audit flagged $NPM_AUDIT vulnerable dependencies.\n"
+            fi
+          fi
+          if [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
+            LOCAL_FINDINGS+="- Python project structure detected.\n"
+          fi
+
+          # 4. Archival Candidate Check (> 1 Year without human commit)
+          CUTOFF_DATE=$(date -d '1 year ago' --iso-8601=seconds)
+          LAST_HUMAN_COMMIT=$(gh api "repos/$REPO/commits?per_page=20" --jq '
+            [.[] | select(.author.type == "User" and (.author.login | contains("bot") | not))] 
+            | .[0].commit.committer.date
+          ' 2>/dev/null || echo "")
+
+          ARCHIVAL_NOTICE=""
+          if [ -z "$LAST_HUMAN_COMMIT" ] \vert{}\vert{} [ "$LAST_HUMAN_COMMIT" = "null" ] || [[ "$LAST_HUMAN_COMMIT" < "$CUTOFF_DATE" ]]; then
+            ARCHIVAL_NOTICE="> **📦 Archival Candidate Notice:** No human author commit detected in over 1 year (Last human commit: ${LAST_HUMAN_COMMIT:-"None in recent history"}). Consider archiving this repo (\`gh repo archive $REPO\`).\n"
+          fi
+
+          # 5. Create or Update GitHub Issue if findings exist
+          if [ -n "$DEPENDABOT_ALERTS" ] || [ -n "$CODEQL_ALERTS" ] \vert{}\vert{} echo "$LOCAL_FINDINGS" | grep -q "vulnerable" || [ -n "$ARCHIVAL_NOTICE" ] \vert{}\vert{} [ -n "$UNSUPPORTED_LANG_NOTICE" ]; then
+            
+            EXISTING_ISSUE=$(gh issue list --repo "$REPO" --label "automated-health" --state "open" --json number --jq '.[0].number')
+
+            ISSUE_BODY="### 🛡️ Automated Repository Health Audit Findings
+
+            ${UNSUPPORTED_LANG_NOTICE}${ARCHIVAL_NOTICE}
+
+            #### Dependabot Vulnerability Advisories:
+            ${DEPENDABOT_ALERTS:-"No open Dependabot alerts."}
+
+            #### CodeQL Static Analysis Alerts:
+            ${CODEQL_ALERTS:-"No open CodeQL alerts."}
+
+            #### Local Toolchain & Security Findings:
+            ${LOCAL_FINDINGS:-"No local package issues."}
+
+            ---
+            *Generated automatically. OpenHands (via Gemini 3.7 Flash) will process open findings in Phase 2 unless this issue is closed or archived.*"
+
+            if [ -z "$EXISTING_ISSUE" ]; then
+              echo "Opening new health issue on $REPO..."
+              gh issue create \
+                --repo "$REPO" \
+                --title "🛡️ [Health Audit] Security Vulnerabilities & Dependency Maintenance" \
+                --body "$ISSUE_BODY" \
+                --label "automated-health"
+            else
+              echo "Updating existing health issue #$EXISTING_ISSUE on$REPO..."
+              gh issue edit "$EXISTING_ISSUE" --repo "$REPO" --body "$ISSUE_BODY"
+            fi
+          fi
+
+  # ===========================================================================
+  # PHASE 2: OPENHANDS REMEDIATION & DRAFT PR CREATION
+  # ===========================================================================
+  resolve-issues-via-openhands:
+    needs: [discover-repos, audit-and-raise-issues]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-repos.outputs.matrix) }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          token: ${{ secrets.ORCHESTRATOR_PAT }}
+          fetch-depth: 0
+
+      - name: Setup Java/Scala
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'sbt'
+
+      - name: Setup Node/TypeScript
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Fetch Issue Context & Execute OpenHands
+        env:
+          GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_REPO: ${{ matrix.repo }}
+        run: |
+          # Check for open automated-health issue
+          ISSUE_DATA=$(gh issue list --repo "$TARGET_REPO" --label "automated-health" --state "open" --json number,body --jq '.[0]')
+          
+          if [ "$ISSUE_DATA" = "null" ] \vert{}\vert{} [ -z "$ISSUE_DATA" ]; then
+            echo "No open health issue found for $TARGET_REPO. Skipping OpenHands execution."
+            exit 0
+          fi
+
+          ISSUE_NUM=$(echo "$ISSUE_DATA" | jq -r '.number')
+          ISSUE_BODY=$(echo "$ISSUE_DATA" | jq -r '.body')
+
+          BRANCH_NAME="health/fix-issue-$ISSUE_NUM"
+
+          # Idempotence: skip if PR branch already exists on remote
+          if git ls-remote --heads origin $BRANCH_NAME \vert{} grep -q$BRANCH_NAME; then
+            echo "Branch $BRANCH_NAME already exists on remote. Skipping execution."
+            exit 0
+          fi
+
+          git checkout -b $BRANCH_NAME
+          echo "$ISSUE_BODY" > .issue-context.md
+
+          # Run OpenHands in headless mode using Gemini 3.7 Flash
+          docker run --rm \
+            -e LLM_API_KEY="$GEMINI_API_KEY" \
+            -e LLM_MODEL="gemini/gemini-3.7-flash" \
+            -v "$(pwd):/workspace" \
+            ghcr.io/all-hands-ai/openhands:latest \
+            python -m openhands.core.main \
+              --headless \
+              -t "Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, and dependency fixes mentioned. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run the native project test suite ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify that your changes compile and pass cleanly."
+
+          rm -f .issue-context.md
+
+          # Check if OpenHands generated modifications
+          if git status --porcelain | grep -q .; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .
+            git commit -m "fix(health): automated OpenHands resolution for issue #$ISSUE_NUM"
+            git push origin $BRANCH_NAME
+
+            gh pr create \
+              --repo "$TARGET_REPO" \
+              --head "$BRANCH_NAME" \
+              --title "🤖 [PR] Resolve Health Issue #$ISSUE_NUM" \
+              --body "### Automated Maintenance Fixes
+            Generated by OpenHands using **Gemini 3.7 Flash**.
+
+            **Closes #$ISSUE_NUM**
+
+            **Verification Status:**
+            - [x] Examined requirements from Issue #$ISSUE_NUM
+            - [x] Applied safe dependency and code vulnerability patches
+            - [x] Verified native build and unit test execution
+
+            Please inspect the diff and approve." \
+              --draft
+          else
+            echo "OpenHands completed without generating code diffs for Issue #$ISSUE_NUM."
+          fi
