@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Find open automated-health issues before allocating remediation workers.
 # Outputs a GitHub Actions matrix of small repo/issue batches. Each batch runs
-# sequentially on one worker so Docker images can be reused locally.
+# sequentially on one worker to bound concurrent agent runs and runner usage.
 set -euo pipefail
 
 REPOS_JSON=${REPOS_JSON:?REPOS_JSON must contain the discovered repository array}

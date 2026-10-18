@@ -1,15 +1,46 @@
 #!/usr/bin/env bash
-# Run one remediation batch on a single Actions worker. Docker images remain in
-# that worker's daemon and are reused by every repository in this batch.
+# Run one remediation batch on a single Actions worker with the OpenHands 1.x
+# headless CLI. The CLI runs the agent in the checkout itself, so there is no
+# sandbox image to pull and no Docker socket to mount.
 set -euo pipefail
 
-OPENHANDS_IMAGE="ghcr.io/all-hands-ai/openhands@sha256:00968de77a7b36546413e1f3b5c6b4e2c387d19ade54de7926e10f5b3d265fa6"
-RUNTIME_IMAGE="ghcr.io/all-hands-ai/runtime:0.59-nikolaik"
-HOST_WORKSPACE="$GITHUB_WORKSPACE"
+OPENHANDS_VERSION=${OPENHANDS_VERSION:-1.16.0}
+LLM_MODEL=${LLM_MODEL:-gemini/gemini-3.7-flash}
 BATCH=${REMEDIATION_BATCH:?REMEDIATION_BATCH must contain a JSON array}
 WORKTREES_DIR="$GITHUB_WORKSPACE/remediation-worktrees"
 mkdir -p "$WORKTREES_DIR"
 gh auth setup-git
+
+REMEDIATION_PROMPT="Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, dependency updates, and GitHub Actions workflow issues mentioned. If workflows are flagged, update action versions in .github/workflows/*.yml to the latest releases. Do not hand-edit .github/workflows/actions.lock: the pipeline regenerates it with 'gh actions-lock' after your edits. If the repo has no lockfile, use full 40-character commit SHAs for any action reference you add or change. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run native test suites ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify cleanly."
+
+# The CLI is installed once per job, not once per repository in the batch.
+ensure_openhands() {
+  export PATH="$HOME/.local/bin:$PATH"
+  if command -v openhands >/dev/null 2>&1 &&
+    openhands --version 2>/dev/null | grep -qF "$OPENHANDS_VERSION"; then
+    return 0
+  fi
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "::error::uv is required to install the OpenHands CLI"
+    return 1
+  fi
+  echo "Installing OpenHands CLI $OPENHANDS_VERSION..."
+  uv tool install --force "openhands==$OPENHANDS_VERSION" --python 3.12
+}
+
+run_openhands() {
+  local target=$1 log=$2
+  (
+    cd "$target" || exit 1
+    # The token stays out of the agent's environment; the script keeps it for
+    # the gh calls before and after this invocation.
+    env -u GH_TOKEN -u GITHUB_TOKEN \
+      LLM_API_KEY="$GEMINI_API_KEY" \
+      LLM_MODEL="$LLM_MODEL" \
+      OPENHANDS_SUPPRESS_BANNER=1 \
+      openhands --headless --json --override-with-envs -t "$REMEDIATION_PROMPT"
+  ) 2>&1 | tee "$log"
+}
 
 run_repo() {
   local repo=$1 issue_num=$2 target=$3 branch issue_state
@@ -22,21 +53,22 @@ run_repo() {
 
   git -C "$target" checkout -b "$branch" || return 1
   gh issue view "$issue_num" --repo "$repo" --json body --jq .body >"$target/.issue-context.md" || return 1
-  mkdir -p "$HOME/.openhands"
 
-  docker run --rm \
-    -e LLM_API_KEY="$GEMINI_API_KEY" \
-    -e LLM_MODEL="gemini/gemini-3.7-flash" \
-    -e SANDBOX_USER_ID="$(id -u)" \
-    -e SANDBOX_VOLUMES="$HOST_WORKSPACE$target:/workspace:rw" \
-    -e SANDBOX_RUNTIME_CONTAINER_IMAGE="$RUNTIME_IMAGE" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v "$HOME/.openhands:/.openhands" \
-    -v "$HOST_WORKSPACE$target:/workspace" \
-    --add-host host.docker.internal:host-gateway \
-    "$OPENHANDS_IMAGE" \
-    python -m openhands.core.main \
-      -t "Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, dependency updates, and GitHub Actions workflow issues mentioned. If workflows are flagged, update action versions in .github/workflows/*.yml to the latest releases. Do not hand-edit .github/workflows/actions.lock: the pipeline regenerates it with 'gh actions-lock' after your edits. If the repo has no lockfile, use full 40-character commit SHAs for any action reference you add or change. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run native test suites ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify cleanly." || return 1
+  local log
+  log=$(mktemp)
+  if ! run_openhands "$target" "$log"; then
+    rm -f "$log"
+    return 1
+  fi
+  # The CLI exits 0 even when the conversation ends in an error, so the
+  # streamed events are the only reliable failure signal.
+  if grep -qE '"kind"[[:space:]]*:[[:space:]]*"ConversationErrorEvent"' "$log"; then
+    echo "::error::OpenHands reported an error while remediating $repo"
+    grep -m 1 -E '"kind"[[:space:]]*:[[:space:]]*"ConversationErrorEvent"' "$log" | cut -c1-800
+    rm -f "$log"
+    return 1
+  fi
+  rm -f "$log"
 
   rm -f "$target/.issue-context.md"
   if [[ -f "$target/.github/workflows/actions.lock" ]] && \
@@ -78,6 +110,8 @@ Please inspect the diff and approve." \
     echo "OpenHands completed without generating code diffs for issue #$issue_num on $repo."
   fi
 }
+
+ensure_openhands
 
 # Issues were checked in the preflight job. Recheck branch/issue state before
 # cloning, then let clones use GitHub CLI's authenticated remote URL.
@@ -127,8 +161,6 @@ while IFS= read -r item; do
 done < <(jq -c '.[]' <<<"$BATCH")
 
 if ((${#READY_REPOS[@]} > 0)); then
-  docker pull "$OPENHANDS_IMAGE"
-  docker pull "$RUNTIME_IMAGE"
   for i in "${!READY_REPOS[@]}"; do
     repo=${READY_REPOS[$i]}
     issue_num=${READY_ISSUES[$i]}

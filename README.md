@@ -13,24 +13,25 @@ with an open `automated-health` issue:
    findings.
 2. **`find-remediation`** — checks for open health issues with bounded parallel
    API calls and batches eligible repositories.
-3. **`resolve-issues`** — runs OpenHands sequentially for each small batch and
-   opens draft PRs. Each batch uses a single runner's Docker daemon, so its
-   OpenHands and runtime images are reused across that batch.
+3. **`resolve-issues`** — runs the OpenHands 1.x headless CLI sequentially over
+   each small batch and opens draft PRs. The CLI is installed once per batch job
+   with `uv` and runs the agent directly in the repository checkout.
 
-GitHub-hosted runner filesystems and Docker daemons are ephemeral: image layers
-cannot be reused across different jobs or workflow runs. The workflow therefore
-uses per-run batching rather than a cross-run Docker cache (which would be large
-and costly to export/import). The default batch size is three; at most four
-batches run concurrently. Repositories without open issues never enter a batch
-and do not incur checkout, tool setup, or image pulls.
+The default batch size is three; at most four batches run concurrently.
+Repositories without open issues never enter a batch and do not incur checkout
+or tool setup.
 
 Phase 1 runs independent sensors in two groups, with at most four concurrent
 sensors per repository. Output is collected in a stable order and failures
 remain isolated as warnings.
 
-Phase 2 intentionally does not install host-side Java, Node, Python, or
-Shellcheck: OpenHands runs in its own runtime sandbox and must provide any
-language-specific tools there. Repository clones are shallow; commits created
+Phase 2 installs only the OpenHands CLI (pinned by `OPENHANDS_VERSION` in
+`.github/scripts/remediate-batch.sh`, currently 1.16.0). The 1.x headless CLI
+runs the agent in the checkout itself, so it uses the runner's existing Node,
+Python, Java, and Shellcheck rather than a separate runtime image. The CLI
+exits successfully even when a conversation errors, so the script inspects the
+streamed events for `ConversationErrorEvent` and fails that repository
+instead of opening an empty PR. Repository clones are shallow; commits created
 by OpenHands are pushed to a new issue branch, so the target's full history is
 not required for remediation.
 

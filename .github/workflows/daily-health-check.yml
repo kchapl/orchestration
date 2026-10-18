@@ -154,6 +154,13 @@ jobs:
         with:
           path: .orchestrator
 
+      # The OpenHands 1.x CLI is a Python tool; the script installs it once per
+      # batch job and runs it directly in each repository checkout.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.13.1"
+
       - name: Run batched OpenHands remediations
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
@@ -161,7 +168,6 @@ jobs:
           REMEDIATION_BATCH: ${{ matrix.batch }}
         run: bash .orchestrator/.github/scripts/remediate-batch.sh
 
-    # Each standard GitHub-hosted runner has its own Docker daemon. Batching
-    # lets that daemon reuse both images across the repositories in its batch;
-    # image storage does not persist between separate workflow jobs or runs.
+    # Batching keeps each runner to one remediation at a time; max-parallel
+    # bounds how many batches (and therefore agents) run concurrently.
     max-parallel: 4
