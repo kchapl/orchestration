@@ -21,6 +21,8 @@
 #   TARGET_DIR  checkout to inspect (default: current working directory)
 #   GH_TOKEN    token for API calls and issue writes (required unless DRY_RUN=1)
 #   DRY_RUN     1 = print the issue body and exit without touching GitHub
+#   AUDIT_RECORD_DIR  when set, write a JSON inventory record for this repo
+#                     into that directory (consumed by render-report.sh)
 
 set -uo pipefail
 
@@ -31,6 +33,7 @@ SUPPORTED_LANGUAGES="Python Shell TypeScript Scala JavaScript Unspecified"
 REPO=${REPO:-}
 TARGET_DIR=${TARGET_DIR:-$PWD}
 DRY_RUN=${DRY_RUN:-0}
+AUDIT_RECORD_DIR=${AUDIT_RECORD_DIR:-}
 
 WORKDIR=""
 cleanup() { [[ -n $WORKDIR ]] && rm -rf "$WORKDIR"; }
@@ -62,6 +65,30 @@ run_sensor() {
 }
 
 capitalize() { local first=${1:0:1}; printf '%s%s' "${first^^}" "${1:1}"; }
+
+# Record this repo's inventory state for the run summary. Advisory only: a
+# failure here must never fail the audit.
+write_record() {
+  [[ -n $AUDIT_RECORD_DIR ]] || return 0
+  mkdir -p "$AUDIT_RECORD_DIR" 2>/dev/null || return 1
+  jq -n \
+    --arg repo "$REPO" \
+    --arg language "$(<"$WORKDIR/language_name")" \
+    --arg language_ok "$(<"$WORKDIR/language_ok")" \
+    --arg code_scanning "$(<"$WORKDIR/code_scanning")" \
+    --arg archival "$(<"$WORKDIR/archival_state")" \
+    --arg last_human "$(<"$WORKDIR/archival_date")" \
+    --argjson findings "$FINDINGS" \
+    '{
+      repo: $repo,
+      language: $language,
+      language_supported: ($language_ok | if . == "true" then true elif . == "false" then false else null end),
+      code_scanning: $code_scanning,
+      archival: $archival,
+      last_human_commit: $last_human,
+      findings: $findings
+    }' >"$AUDIT_RECORD_DIR/${REPO//\//__}.json"
+}
 
 # Classify a gh api failure. Prints a human-readable reason and returns:
 #   3 = the feature is not enabled / has no data (404), which is not a fault
@@ -110,6 +137,7 @@ sensor_codeql() {
     reason=$(gh_error_reason "$out" "code scanning")
     status=$?
     if ((status == 3)); then
+      printf 'not_enabled' >"$WORKDIR/code_scanning"
       printf '_%s_\n' "$(capitalize "$reason")" >"$WORKDIR/codeql_note"
       printf '%s\n' "$reason" >&2
       return 3
@@ -117,6 +145,7 @@ sensor_codeql() {
     printf '%s\n' "$reason" >&2
     return 1
   fi
+  printf 'enabled' >"$WORKDIR/code_scanning"
   printf '%s\n' "$out" | sed '/^$/d' >"$WORKDIR/codeql"
 }
 
@@ -126,11 +155,14 @@ sensor_language() {
     printf 'repository metadata request failed\n' >&2
     return 1
   }
+  printf '%s' "$lang" >"$WORKDIR/language_name"
   case " $SUPPORTED_LANGUAGES " in
   *" $lang "*)
+    printf 'true' >"$WORKDIR/language_ok"
     return 0
     ;;
   esac
+  printf 'false' >"$WORKDIR/language_ok"
   printf "> **⚠️ Unsupported primary language:** \`%s\` is outside the supported set (%s). Remediation can still edit files, but native test suites may need a custom toolchain.\n" \
     "$lang" "${SUPPORTED_LANGUAGES// /, }" >"$WORKDIR/language"
 }
@@ -148,6 +180,7 @@ sensor_archival() {
   cutoff=$(($(date -u +%s) - 365 * 24 * 3600))
 
   if [[ -z $last || $last == null ]]; then
+    printf 'candidate' >"$WORKDIR/archival_state"
     printf "> **📦 Archival candidate:** no human-authored commit in the last 100 commits. Consider \`gh repo archive %s\`.\n" \
       "$REPO" >"$WORKDIR/archival"
     return 0
@@ -157,9 +190,13 @@ sensor_archival() {
     printf 'unparsable commit date: %s\n' "$last" >&2
     return 1
   }
+  printf '%s' "$last" >"$WORKDIR/archival_date"
   if ((ts < cutoff)); then
+    printf 'candidate' >"$WORKDIR/archival_state"
     printf "> **📦 Archival candidate:** last human commit was %s (over a year ago). Consider \`gh repo archive %s\`.\n" \
       "${last%%T*}" "$REPO" >"$WORKDIR/archival"
+  else
+    printf 'active' >"$WORKDIR/archival_state"
   fi
 }
 
@@ -314,6 +351,12 @@ render_body() {
 WORKDIR=$(mktemp -d) || fail "could not create a temp directory"
 for s in dependabot codeql local actions warnings language archival \
   dependabot_note codeql_note; do : >"$WORKDIR/$s"; done
+# Inventory state surfaced in the run summary, kept separate from findings.
+printf 'unknown' >"$WORKDIR/code_scanning"
+printf 'unknown' >"$WORKDIR/archival_state"
+printf '' >"$WORKDIR/language_name"
+printf 'unknown' >"$WORKDIR/language_ok"
+printf '' >"$WORKDIR/archival_date"
 
 if [[ $DRY_RUN != 1 ]]; then
   gh api user --jq .login >/dev/null 2>&1 ||
@@ -333,6 +376,8 @@ BODY=$(render_body)
 FINDINGS=$(( $(count_lines "$WORKDIR/dependabot") + $(count_lines "$WORKDIR/codeql") \
   + $(count_lines "$WORKDIR/local") + $(count_lines "$WORKDIR/actions") \
   + $(count_lines "$WORKDIR/language") + $(count_lines "$WORKDIR/archival") ))
+
+write_record || warn "could not write the audit record for $REPO"
 
 if ((FINDINGS == 0)); then
   log "No actionable findings for $REPO; no issue raised."

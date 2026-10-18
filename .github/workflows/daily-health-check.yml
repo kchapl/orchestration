@@ -74,7 +74,43 @@ jobs:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
           REPO: ${{ matrix.repo }}
           TARGET_DIR: ${{ github.workspace }}/target
+          AUDIT_RECORD_DIR: ${{ github.workspace }}/audit-records
         run: bash .orchestrator/.github/scripts/audit-repo.sh
+
+      - name: Upload audit record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-record-${{ strategy.job-index }}
+          path: ${{ github.workspace }}/audit-records
+          if-no-files-found: warn
+          retention-days: 1
+
+  # ===========================================================================
+  # SUMMARY: Cross-Repo Inventory Report
+  # ===========================================================================
+  report:
+    name: summary
+    needs: [discover-repos, audit-and-raise-issues]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout health-check tooling
+        uses: actions/checkout@v4
+        with:
+          path: .orchestrator
+
+      # Advisory input only: a run with no records still renders a summary.
+      - name: Collect audit records
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: audit-record-*
+          path: audit-records
+          merge-multiple: true
+
+      - name: Write run summary
+        run: bash .orchestrator/.github/scripts/render-report.sh audit-records >> "$GITHUB_STEP_SUMMARY"
 
   # ===========================================================================
   # PHASE 2: OPENHANDS REMEDIATION & DRAFT PR CREATION

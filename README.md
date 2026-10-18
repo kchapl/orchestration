@@ -33,6 +33,18 @@ warning, because it says nothing about the repo's health. Findings, not sensor
 health, decide whether an issue is raised. An authentication failure is the one
 hard error, so a broken token can never produce a green "all clean" run.
 
+### Run summary
+
+Every audit job writes a JSON inventory record, and the `report` job aggregates
+them into the workflow run summary:
+
+- repositories where code scanning is not enabled
+- candidates for archiving, with the date of the last human commit
+- repositories whose primary language is outside the supported set
+
+The report is advisory: if a run produced no records, the summary says so
+rather than failing.
+
 ### Running the audit locally
 
 `gh` must be authenticated (`GH_TOKEN` or `gh auth login`); `jq` is required.
@@ -43,6 +55,10 @@ REPO=owner/name DRY_RUN=1 ./.github/scripts/audit-repo.sh
 
 # Audit another checkout, creating/updating the issue if findings exist
 REPO=owner/name TARGET_DIR=/path/to/checkout ./.github/scripts/audit-repo.sh
+
+# Write inventory records, then render the run summary from them
+REPO=owner/name AUDIT_RECORD_DIR=records ./.github/scripts/audit-repo.sh
+./.github/scripts/render-report.sh records >> "$GITHUB_STEP_SUMMARY"
 ```
 
 ### Required secrets
