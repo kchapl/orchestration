@@ -154,7 +154,6 @@ jobs:
             -v "$(pwd):/workspace" \
             ghcr.io/all-hands-ai/openhands:latest \
             python -m openhands.core.main \
-              --headless \
               -t "Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, dependency updates, and GitHub Actions workflow issues mentioned. If workflows are flagged, update action versions in .github/workflows/*.yml to the latest releases and ensure proper commit SHA pinning or lockfile generation. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run native test suites ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify cleanly."
 
           rm -f .issue-context.md
