@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Find open automated-health issues before allocating remediation workers.
-# Outputs a GitHub Actions matrix of small repo/issue batches. Each batch runs
-# sequentially on one worker to bound concurrent agent runs and runner usage.
+# Outputs a GitHub Actions matrix with one entry per affected repository, so a
+# slow or failing remediation cannot hold up any other repository.
 set -euo pipefail
 
 REPOS_JSON=${REPOS_JSON:?REPOS_JSON must contain the discovered repository array}
 OUTPUT_FILE=${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}
-BATCH_SIZE=${BATCH_SIZE:-3}
 LOOKUP_CONCURRENCY=${LOOKUP_CONCURRENCY:-8}
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
@@ -45,18 +44,14 @@ done
 
 shopt -s nullglob
 results=("$TEMP_DIR"/*.json)
-if ((${#results[@]} == 0)); then
-  printf 'matrix={"batch":["[]"]}\nhas_work=false\n' >>"$OUTPUT_FILE"
-  echo "Found 0 repository/repositories requiring remediation"
-  exit 0
-fi
-ELIGIBLE=$(jq -cs --argjson size "$BATCH_SIZE" '
-  map(select(. != null)) as $repos
-  | [range(0; ($repos | length); $size) as $i | $repos[$i:($i + $size)]]
-' "${results[@]}")
-COUNT=$(jq '[.[][]] | length' <<<"$ELIGIBLE")
-BATCHES=$(jq -c 'if length == 0 then ["[]"] else map(tojson) end' <<<"$ELIGIBLE")
-MATRIX=$(jq -cn --argjson batches "$BATCHES" '{batch: $batches}')
+MATRIX=$(jq -cs '{include: map(select(. != null))}' "${results[@]}")
+COUNT=$(jq '.include | length' <<<"$MATRIX")
 echo "Found $COUNT repository/repositories requiring remediation"
+
+# An empty include list is not a valid matrix. Keep a placeholder entry; the
+# resolve-issues job is skipped by its has_work condition, not by the matrix.
+if ((COUNT == 0)); then
+  MATRIX='{"include":[{"repo":"","issue":0}]}'
+fi
 echo "matrix=$MATRIX" >>"$OUTPUT_FILE"
 echo "has_work=$([[ $COUNT -gt 0 ]] && echo true || echo false)" >>"$OUTPUT_FILE"

@@ -58,12 +58,12 @@ jobs:
     steps:
       # The audit logic lives in this repo so it can be run and tested locally.
       - name: Checkout health-check tooling
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           path: .orchestrator
 
       - name: Checkout target repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           repository: ${{ matrix.repo }}
           token: ${{ secrets.ORCHESTRATOR_PAT }}
@@ -79,7 +79,7 @@ jobs:
 
       - name: Upload audit record
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: audit-record-${{ strategy.job-index }}
           path: ${{ github.workspace }}/audit-records
@@ -96,14 +96,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout health-check tooling
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           path: .orchestrator
 
       # Advisory input only: a run with no records still renders a summary.
       - name: Collect audit records
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.3.0
         with:
           pattern: audit-record-*
           path: audit-records
@@ -119,22 +119,21 @@ jobs:
     needs: [discover-repos, audit-and-raise-issues]
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.batches.outputs.matrix }}
-      has_work: ${{ steps.batches.outputs.has_work }}
+      matrix: ${{ steps.remediation.outputs.matrix }}
+      has_work: ${{ steps.remediation.outputs.has_work }}
     steps:
       - name: Checkout health-check tooling
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           path: .orchestrator
 
-      - name: Find open issues and group repositories
-        id: batches
+      - name: Find repositories with open issues
+        id: remediation
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
           REPOS_JSON: ${{ needs.discover-repos.outputs.matrix }}
-          BATCH_SIZE: 3
           LOOKUP_CONCURRENCY: 8
-        run: bash .orchestrator/.github/scripts/discover-remediation-batches.sh
+        run: bash .orchestrator/.github/scripts/discover-remediation.sh
 
   # ===========================================================================
   # PHASE 2: OPENHANDS REMEDIATION & DRAFT PR CREATION
@@ -142,31 +141,33 @@ jobs:
   resolve-issues:
     needs: [find-remediation]
     if: needs.find-remediation.outputs.has_work == 'true'
-    name: remediate batch ${{ strategy.job-index }}
+    name: remediate ${{ matrix.repo }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      # Batching keeps each runner to one remediation at a time; max-parallel
-      # bounds how many batches (and therefore agents) run concurrently.
+      # One job per repository, but cap how many agents run at once so a large
+      # backlog cannot consume every runner and API quota in a single burst.
       max-parallel: 4
       matrix: ${{ fromJson(needs.find-remediation.outputs.matrix) }}
 
     steps:
       - name: Checkout health-check tooling
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           path: .orchestrator
 
-      # The OpenHands 1.x CLI is a Python tool; the script installs it once per
-      # batch job and runs it directly in each repository checkout.
+      # The OpenHands 1.x CLI is a Python tool; the script installs it in this
+      # job and runs it directly in the repository checkout.
       - name: Set up uv
         uses: astral-sh/setup-uv@v10.3.0
         with:
           version: "0.13.1"
 
-      - name: Run batched OpenHands remediations
+      - name: Run OpenHands remediation
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          REMEDIATION_BATCH: ${{ matrix.batch }}
-        run: bash .orchestrator/.github/scripts/remediate-batch.sh
+          LLM_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          LLM_MODEL: deepseek/deepseek-flash
+          REPO: ${{ matrix.repo }}
+          ISSUE: ${{ matrix.issue }}
+        run: bash .orchestrator/.github/scripts/remediate-issue.sh

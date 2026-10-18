@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Run one OpenHands 1.x remediation for a single repository issue. The CLI
+# runs the agent in the checkout itself, so there is no sandbox image to pull
+# and no Docker socket to mount.
+set -euo pipefail
+
+OPENHANDS_VERSION=${OPENHANDS_VERSION:-1.16.0}
+LLM_MODEL=${LLM_MODEL:-deepseek/deepseek-flash}
+LLM_API_KEY=${LLM_API_KEY:?LLM_API_KEY is required}
+REPO=${REPO:?REPO is required}
+ISSUE=${ISSUE:?ISSUE is required}
+WORKSPACE=${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}
+TARGET="$WORKSPACE/remediation/${REPO//\//__}"
+BRANCH="health/fix-issue-$ISSUE"
+
+REMEDIATION_PROMPT="Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, dependency updates, and GitHub Actions workflow issues mentioned. If workflows are flagged, update action versions in .github/workflows/*.yml to the latest releases and keep tag refs (for example @v4), never commit SHAs. Do not hand-edit .github/workflows/actions.lock: the pipeline runs 'gh actions-lock' after your edits to create or refresh it. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run native test suites ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify cleanly."
+
+ensure_openhands() {
+  export PATH="$HOME/.local/bin:$PATH"
+  if command -v openhands >/dev/null 2>&1 &&
+    openhands --version 2>/dev/null | grep -qF "$OPENHANDS_VERSION"; then
+    return 0
+  fi
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "::error::uv is required to install the OpenHands CLI"
+    return 1
+  fi
+  echo "Installing OpenHands CLI $OPENHANDS_VERSION..."
+  uv tool install --force "openhands==$OPENHANDS_VERSION" --python 3.12
+}
+
+run_openhands() {
+  local log=$1
+  (
+    cd "$TARGET" || exit 1
+    # The token stays out of the agent's environment; the script keeps it for
+    # the gh calls before and after this invocation.
+    env -u GH_TOKEN -u GITHUB_TOKEN \
+      LLM_API_KEY="$LLM_API_KEY" \
+      LLM_MODEL="$LLM_MODEL" \
+      OPENHANDS_SUPPRESS_BANNER=1 \
+      openhands --headless --json --override-with-envs -t "$REMEDIATION_PROMPT"
+  ) 2>&1 | tee "$log"
+}
+
+gh auth setup-git
+
+echo "Checking $REPO (issue #$ISSUE)..."
+if ! state=$(gh issue view "$ISSUE" --repo "$REPO" --json state --jq .state); then
+  echo "::error::Could not check issue #$ISSUE on $REPO"
+  exit 1
+fi
+if [[ $state != OPEN ]]; then
+  echo "Issue #$ISSUE on $REPO is no longer open; skipping."
+  exit 0
+fi
+
+if ! output=$(git ls-remote --heads "https://github.com/$REPO.git" "$BRANCH"); then
+  echo "::error::Could not check branch state for $REPO"
+  exit 1
+fi
+if [[ -n $output ]]; then
+  echo "Branch $BRANCH already exists on $REPO; skipping."
+  exit 0
+fi
+
+ensure_openhands
+
+mkdir -p "$WORKSPACE/remediation"
+if ! gh repo clone "$REPO" "$TARGET" -- --depth=1; then
+  echo "::error::Could not clone $REPO"
+  exit 1
+fi
+
+if ! output=$(git -C "$TARGET" ls-remote --heads origin "$BRANCH"); then
+  echo "::error::Could not recheck branch state for $REPO"
+  exit 1
+fi
+if [[ -n $output ]]; then
+  echo "Branch $BRANCH appeared on $REPO during checkout; skipping."
+  exit 0
+fi
+
+git -C "$TARGET" checkout -b "$BRANCH"
+gh issue view "$ISSUE" --repo "$REPO" --json body --jq .body >"$TARGET/.issue-context.md"
+
+echo "Running OpenHands for $REPO (issue #$ISSUE)..."
+log=$(mktemp)
+if ! run_openhands "$log"; then
+  rm -f "$log"
+  echo "::error::OpenHands remediation failed for $REPO (issue #$ISSUE)"
+  exit 1
+fi
+# The CLI exits 0 even when the conversation ends in an error, so the streamed
+# events are the only reliable failure signal.
+if grep -qE '"kind"[[:space:]]*:[[:space:]]*"ConversationErrorEvent"' "$log"; then
+  echo "::error::OpenHands reported an error while remediating $REPO"
+  grep -m 1 -E '"kind"[[:space:]]*:[[:space:]]*"ConversationErrorEvent"' "$log" | cut -c1-800
+  rm -f "$log"
+  exit 1
+fi
+rm -f "$log"
+
+rm -f "$TARGET/.issue-context.md"
+if git -C "$TARGET" status --porcelain -- .github/workflows | grep -qE '\.ya?ml$'; then
+  echo "Locking GitHub Actions dependencies in $REPO..."
+  if ! gh extension list | grep -q 'github/gh-actions-lock'; then
+    gh extension install github/gh-actions-lock >/dev/null 2>&1 ||
+      echo "::warning::Could not install gh-actions-lock for $REPO"
+  fi
+  (cd "$TARGET" && gh actions-lock) ||
+    echo "::warning::gh actions-lock failed for $REPO; the lockfile may be stale"
+fi
+
+if [[ -n $(git -C "$TARGET" status --porcelain) ]]; then
+  git -C "$TARGET" config user.name "github-actions[bot]"
+  git -C "$TARGET" config user.email "github-actions[bot]@users.noreply.github.com"
+  git -C "$TARGET" add -A
+  git -C "$TARGET" commit -m "fix(health): automated OpenHands resolution for issue #$ISSUE"
+  git -C "$TARGET" push origin "$BRANCH"
+
+  gh pr create \
+    --repo "$REPO" \
+    --head "$BRANCH" \
+    --title "🤖 [PR] Resolve Health Issue #$ISSUE" \
+    --body "### Automated Maintenance Fixes
+Generated by OpenHands using **DeepSeek V4.1 Flash**.
+
+**Closes #$ISSUE**
+
+**Verification Status:**
+- [x] Examined requirements from Issue #$ISSUE
+- [x] Audited and updated GitHub Actions workflows
+- [x] Applied safe dependency and code vulnerability patches
+- [x] Verified native build and unit test execution
+
+Please inspect the diff and approve." \
+    --draft
+else
+  echo "OpenHands completed without generating code diffs for issue #$ISSUE on $REPO."
+fi

@@ -12,28 +12,32 @@ with an open `automated-health` issue:
    target checkout and creates or updates an issue when it finds actionable
    findings.
 2. **`find-remediation`** — checks for open health issues with bounded parallel
-   API calls and batches eligible repositories.
-3. **`resolve-issues`** — runs the OpenHands 1.x headless CLI sequentially over
-   each small batch and opens draft PRs. The CLI is installed once per batch job
-   with `uv` and runs the agent directly in the repository checkout.
+   API calls and builds a remediation matrix.
+3. **`resolve-issues`** — runs one job per affected repository with the
+   OpenHands 1.x headless CLI and opens a draft PR. The CLI is installed in that
+   job with `uv`, and the agent runs directly in the repository checkout.
 
-The default batch size is three; at most four batches run concurrently.
-Repositories without open issues never enter a batch and do not incur checkout
-or tool setup.
+At most four remediation jobs run concurrently. Repositories without open
+issues never get a job and do not incur checkout or tool setup. Because each
+repository has its own job, a slow or failing remediation does not delay the
+others.
 
 Phase 1 runs independent sensors in two groups, with at most four concurrent
 sensors per repository. Output is collected in a stable order and failures
 remain isolated as warnings.
 
 Phase 2 installs only the OpenHands CLI (pinned by `OPENHANDS_VERSION` in
-`.github/scripts/remediate-batch.sh`, currently 1.16.0). The 1.x headless CLI
+`.github/scripts/remediate-issue.sh`, currently 1.16.0). The 1.x headless CLI
 runs the agent in the checkout itself, so it uses the runner's existing Node,
 Python, Java, and Shellcheck rather than a separate runtime image. The CLI
 exits successfully even when a conversation errors, so the script inspects the
 streamed events for `ConversationErrorEvent` and fails that repository
-instead of opening an empty PR. Repository clones are shallow; commits created
-by OpenHands are pushed to a new issue branch, so the target's full history is
-not required for remediation.
+instead of opening an empty PR. After workflow edits it runs `gh actions-lock`
+to create or refresh `.github/workflows/actions.lock`, so action refs stay as
+tags rather than commit SHAs. The agent defaults to `deepseek/deepseek-flash`
+(DeepSeek V4.1 Flash); override `LLM_MODEL` to use another LiteLLM model.
+Repository clones are shallow; commits created by OpenHands are pushed to a new
+issue branch, so the target's full history is not required for remediation.
 
 ### Phase 1 sensors
 
@@ -94,7 +98,7 @@ REPO=owner/name AUDIT_RECORD_DIR=records ./.github/scripts/audit-repo.sh
 | Secret | Purpose |
 | --- | --- |
 | `ORCHESTRATOR_PAT` | repo discovery, issue writes, checkouts, PR pushes |
-| `GEMINI_API_KEY` | OpenHands model access in phase 2 |
+| `DEEPSEEK_API_KEY` | OpenHands model access in phase 2 (DeepSeek V4.1 Flash) |
 
 `ORCHESTRATOR_PAT` also needs read access to security alerts, otherwise phase 1
 reports "the token cannot read …". On a classic PAT that is the

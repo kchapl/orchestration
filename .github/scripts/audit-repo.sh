@@ -273,17 +273,19 @@ lockfile_map() {
   awk '
     /^workflows:[[:space:]]*$/ { in_wf = 1; wf = ""; next }
     /^[^[:space:]]/ { in_wf = 0 }
-    in_wf && /^  [^[:space:]-][^:]*:[[:space:]]*$/ {
-      wf = $0
-      sub(/:[[:space:]]*$/, "", wf)
-      wf = substr(wf, 3)
-      print wf "\t"
-      next
-    }
     in_wf && /^[[:space:]]+-[[:space:]]+/ {
       pin = $0
       sub(/^[[:space:]]+-[[:space:]]+/, "", pin)
+      gsub(/["\047]/, "", pin)
       print wf "\t" pin
+      next
+    }
+    in_wf && /^[[:space:]]+[^[:space:]-][^:]*:[[:space:]]*$/ {
+      wf = $0
+      sub(/^[[:space:]]+/, "", wf)
+      sub(/:[[:space:]]*$/, "", wf)
+      gsub(/["\047]/, "", wf)
+      print wf "\t"
     }
   ' "$1"
 }
