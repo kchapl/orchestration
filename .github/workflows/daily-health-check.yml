@@ -140,7 +140,10 @@ jobs:
   # ===========================================================================
   # PHASE 2: OPENHANDS REMEDIATION & DRAFT PR CREATION
   # ===========================================================================
-  resolve-issues-via-openhands:
+# ===========================================================================
+  # PHASE 2: OPENHANDS REMEDIATION & DRAFT PR CREATION
+  # ===========================================================================
+  resolve-issues:
     needs: [discover-repos, audit-and-raise-issues]
     runs-on: ubuntu-latest
     strategy:
@@ -181,26 +184,32 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_REPO: ${{ matrix.repo }}
         run: |
-          # Check for open automated-health issue
-          ISSUE_DATA=$(gh issue list --repo "$TARGET_REPO" --label "automated-health" --state "open" --json number,body --jq '.[0]')
+          # Fetch open automated-health issue
+          ISSUE_DATA=$(gh issue list --repo "$TARGET_REPO" --label "automated-health" --state "open" --json number,body --jq '.[0]' 2>/dev/null || echo "")
           
-          if [ "$ISSUE_DATA" = "null" ] \vert{}\vert{} [ -z "$ISSUE_DATA" ]; then
+          # Fix: Use double brackets [[ ]] to prevent 'too many arguments' errors on multi-line/JSON strings
+          if [[ -z "$ISSUE_DATA" || "$ISSUE_DATA" == "null" ]]; then
             echo "No open health issue found for $TARGET_REPO. Skipping OpenHands execution."
             exit 0
           fi
 
-          ISSUE_NUM=$(echo "$ISSUE_DATA" | jq -r '.number')
-          ISSUE_BODY=$(echo "$ISSUE_DATA" | jq -r '.body')
+          ISSUE_NUM=$(echo "$ISSUE_DATA" | jq -r '.number // empty')
+          ISSUE_BODY=$(echo "$ISSUE_DATA" | jq -r '.body // empty')
+
+          if [[ -z "$ISSUE_NUM" ]]; then
+            echo "Could not parse valid issue number for $TARGET_REPO. Skipping."
+            exit 0
+          fi
 
           BRANCH_NAME="health/fix-issue-$ISSUE_NUM"
 
           # Idempotence: skip if PR branch already exists on remote
-          if git ls-remote --heads origin $BRANCH_NAME \vert{} grep -q$BRANCH_NAME; then
+          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
             echo "Branch $BRANCH_NAME already exists on remote. Skipping execution."
             exit 0
           fi
 
-          git checkout -b $BRANCH_NAME
+          git checkout -b "$BRANCH_NAME"
           echo "$ISSUE_BODY" > .issue-context.md
 
           # Run OpenHands in headless mode using Gemini 3.7 Flash
@@ -221,7 +230,7 @@ jobs:
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add .
             git commit -m "fix(health): automated OpenHands resolution for issue #$ISSUE_NUM"
-            git push origin $BRANCH_NAME
+            git push origin "$BRANCH_NAME"
 
             gh pr create \
               --repo "$TARGET_REPO" \
