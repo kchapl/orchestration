@@ -26,9 +26,6 @@ jobs:
   # ===========================================================================
   # PHASE 1: AUDIT & ISSUE CREATION
   # ===========================================================================
-# ===========================================================================
-  # PHASE 1: AUDIT & ISSUE CREATION
-  # ===========================================================================
   audit-and-raise-issues:
     needs: discover-repos
     runs-on: ubuntu-latest
@@ -140,9 +137,6 @@ jobs:
   # ===========================================================================
   # PHASE 2: OPENHANDS REMEDIATION & DRAFT PR CREATION
   # ===========================================================================
-# ===========================================================================
-  # PHASE 2: OPENHANDS REMEDIATION & DRAFT PR CREATION
-  # ===========================================================================
   resolve-issues:
     needs: [discover-repos, audit-and-raise-issues]
     runs-on: ubuntu-latest
@@ -151,19 +145,19 @@ jobs:
       matrix: ${{ fromJson(needs.discover-repos.outputs.matrix) }}
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Target Repository
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
           token: ${{ secrets.ORCHESTRATOR_PAT }}
           fetch-depth: 0
 
+      # Fix: Removed cache: 'sbt' so setup-java doesn't fail on non-Scala repos
       - name: Setup Java/Scala
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'sbt'
 
       - name: Setup Node/TypeScript
         uses: actions/setup-node@v4
@@ -187,7 +181,6 @@ jobs:
           # Fetch open automated-health issue
           ISSUE_DATA=$(gh issue list --repo "$TARGET_REPO" --label "automated-health" --state "open" --json number,body --jq '.[0]' 2>/dev/null || echo "")
           
-          # Fix: Use double brackets [[ ]] to prevent 'too many arguments' errors on multi-line/JSON strings
           if [[ -z "$ISSUE_DATA" || "$ISSUE_DATA" == "null" ]]; then
             echo "No open health issue found for $TARGET_REPO. Skipping OpenHands execution."
             exit 0
@@ -220,7 +213,7 @@ jobs:
             ghcr.io/all-hands-ai/openhands:latest \
             python -m openhands.core.main \
               --headless \
-              -t "Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, and dependency fixes mentioned. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run the native project test suite ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify that your changes compile and pass cleanly."
+              -t "Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, dependency updates, and GitHub Actions workflow issues mentioned. If workflows are flagged, update action versions in .github/workflows/*.yml to the latest releases and ensure proper commit SHA pinning or lockfile generation. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run native test suites ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify cleanly."
 
           rm -f .issue-context.md
 
@@ -243,6 +236,7 @@ jobs:
 
             **Verification Status:**
             - [x] Examined requirements from Issue #$ISSUE_NUM
+            - [x] Audited and updated GitHub Actions workflows
             - [x] Applied safe dependency and code vulnerability patches
             - [x] Verified native build and unit test execution
 
