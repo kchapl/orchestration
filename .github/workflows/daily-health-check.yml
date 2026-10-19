@@ -167,7 +167,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
           LLM_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          LLM_MODEL: gemini/gemini-3.8-flash
+          LLM_MODEL: openrouter/free
           REPO: ${{ matrix.repo }}
           ISSUE: ${{ matrix.issue }}
         run: bash .orchestrator/.github/scripts/remediate-issue.sh
