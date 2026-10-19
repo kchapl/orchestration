@@ -166,7 +166,7 @@ jobs:
 
       - name: Run OpenHands remediation
         env:
-#          GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
+          GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
           LLM_API_KEY: ${{ secrets.ORCHESTRATOR_PAT }}
           LLM_MODEL: azure_ai/gpt-4o-mini
           LLM_BASE_URL: https://models.inference.ai.azure.com
