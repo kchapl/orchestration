@@ -168,9 +168,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
           LLM_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           LLM_MODEL: gemini/gemini-3.8-flash
-          LLM_CACHING_PROMPT: "false"
           LLM_NUM_RETRIES: "8"
           LLM_RETRY_MIN_WAIT: "5"
           LLM_RETRY_MAX_WAIT: "60"

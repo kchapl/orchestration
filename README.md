@@ -35,21 +35,26 @@ streamed events for `ConversationErrorEvent` and fails that repository
 instead of opening an empty PR. After workflow edits it runs `gh actions-lock`
 to create or refresh `.github/workflows/actions.lock`, so action refs stay as
 tags rather than commit SHAs. The remediation workflow uses Google's
-`gemini/gemini-3.8-flash` through LiteLLM, with OpenHands prompt-cache markers
-disabled (`LLM_CACHING_PROMPT=false`) to avoid explicit cached-content creation
-that exceeds the Gemini free tier's zero cache-storage quota. The workflow
-retries transient LLM errors with up to eight attempts, exponential backoff,
-and a 60-second cap; retries cannot fix quota errors on their own. Gemini 3.8
-Flash has a 1,048,576-token input limit and a 65,536-token output limit. The
+`gemini/gemini-3.8-flash` through LiteLLM. It writes a private, temporary
+OpenHands agent configuration with prompt caching disabled for both the agent
+and its condenser, avoiding explicit cached-content creation that exceeds the
+Gemini free tier's zero cache-storage quota. The file is removed after the run.
+The workflow retries transient LLM errors with up to eight attempts,
+exponential backoff, and a 60-second cap; retries cannot fix quota errors on
+their own. Gemini 3.8 Flash has a 1,048,576-token input limit and a
+65,536-token output limit. The
 Gemini API free tier currently includes free input and output tokens for
 eligible models, but request and token rate limits are project-specific; check
 AI Studio for the limits active on your project. Google may use free-tier
-content to improve its products. Disabling OpenHands cache markers prevents
-this workflow from requesting explicit Gemini cache storage; it does not change
-Google's separate implicit caching behavior or guarantee against other 429
-quota/rate-limit errors. Repository clones are shallow; commits
+content to improve its products. The temporary agent configuration prevents
+OpenHands from adding explicit cache markers; it does not change Google's
+separate implicit caching behavior or guarantee against other 429 quota/rate-
+limit errors. Repository clones are shallow; commits
 created by OpenHands are pushed to a new issue branch, so the target's full
-history is not required for remediation.
+history is not required for remediation. To quickly verify the temporary agent
+configuration without calling Gemini, run the manual-only
+`Verify OpenHands Gemini Config` workflow; it installs the pinned CLI and checks
+that caching stays disabled for the agent and condenser.
 
 ### Phase 1 sensors
 

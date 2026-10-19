@@ -10,6 +10,7 @@ LLM_API_KEY=${LLM_API_KEY:?LLM_API_KEY is required}
 REPO=${REPO:?REPO is required}
 ISSUE=${ISSUE:?ISSUE is required}
 WORKSPACE=${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 TARGET="$WORKSPACE/remediation/${REPO//\//__}"
 BRANCH="health/fix-issue-$ISSUE"
 
@@ -29,8 +30,24 @@ ensure_openhands() {
   uv tool install --force "openhands==$OPENHANDS_VERSION" --python 3.12
 }
 
+configure_openhands_agent() {
+  local persistence_dir=$1
+  local python
+  python="$(uv tool dir)/openhands/bin/python"
+  if [[ ! -x $python ]]; then
+    echo "::error::Could not find the OpenHands tool Python interpreter"
+    return 1
+  fi
+
+  OPENHANDS_PERSISTENCE_DIR="$persistence_dir" \
+    LLM_API_KEY="$LLM_API_KEY" \
+    LLM_MODEL="$LLM_MODEL" \
+    "$python" "$SCRIPT_DIR/configure-openhands-agent.py"
+}
+
 run_openhands() {
   local log=$1
+  local persistence_dir=$2
   (
     cd "$TARGET" || exit 1
     # The token stays out of the agent's environment; the script keeps it for
@@ -38,6 +55,7 @@ run_openhands() {
     env -u GH_TOKEN -u GITHUB_TOKEN \
       LLM_API_KEY="$LLM_API_KEY" \
       LLM_MODEL="$LLM_MODEL" \
+      OPENHANDS_PERSISTENCE_DIR="$persistence_dir" \
       OPENHANDS_SUPPRESS_BANNER=1 \
       openhands --headless --json --override-with-envs -t "$REMEDIATION_PROMPT"
   ) 2>&1 | tee "$log"
@@ -85,8 +103,15 @@ git -C "$TARGET" checkout -b "$BRANCH"
 gh issue view "$ISSUE" --repo "$REPO" --json body --jq .body >"$TARGET/.issue-context.md"
 
 echo "Running OpenHands for $REPO (issue #$ISSUE)..."
+persistence_dir=$(mktemp -d)
+chmod 700 "$persistence_dir"
+trap 'rm -rf -- "$persistence_dir"' EXIT
+if ! configure_openhands_agent "$persistence_dir"; then
+  echo "::error::Could not configure the OpenHands Gemini agent"
+  exit 1
+fi
 log=$(mktemp)
-if ! run_openhands "$log"; then
+if ! run_openhands "$log" "$persistence_dir"; then
   rm -f "$log"
   echo "::error::OpenHands remediation failed for $REPO (issue #$ISSUE)"
   exit 1
