@@ -15,7 +15,8 @@ jobs:
   discover-repos:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+     # matrix: ${{ steps.set-matrix.outputs.matrix }}
+      matrix: '{"repo": ["kchapl/book-lamp"]}'
     steps:
       - name: Fetch repository list via GitHub API
         id: set-matrix
@@ -167,7 +168,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
           LLM_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          LLM_MODEL: nvidia/nemotron-3-ultra-550b-a55b:free
+          LLM_MODEL: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
           REPO: ${{ matrix.repo }}
           ISSUE: ${{ matrix.issue }}
         run: bash .orchestrator/.github/scripts/remediate-issue.sh
