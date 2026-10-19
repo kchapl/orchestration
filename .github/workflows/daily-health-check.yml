@@ -167,8 +167,14 @@ jobs:
       - name: Run OpenHands remediation
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
-          LLM_API_KEY: ${{ secrets.ORCHESTRATOR_PAT }}
-          LLM_MODEL: github/gpt-4o-mini
+          LLM_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LLM_MODEL: gemini/gemini-3.8-flash
+          LLM_CACHING_PROMPT: "false"
+          LLM_NUM_RETRIES: "8"
+          LLM_RETRY_MIN_WAIT: "5"
+          LLM_RETRY_MAX_WAIT: "60"
+          LLM_RETRY_MULTIPLIER: "2"
           REPO: ${{ matrix.repo }}
           ISSUE: ${{ matrix.issue }}
         run: bash .orchestrator/.github/scripts/remediate-issue.sh

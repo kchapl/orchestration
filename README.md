@@ -34,10 +34,22 @@ exits successfully even when a conversation errors, so the script inspects the
 streamed events for `ConversationErrorEvent` and fails that repository
 instead of opening an empty PR. After workflow edits it runs `gh actions-lock`
 to create or refresh `.github/workflows/actions.lock`, so action refs stay as
-tags rather than commit SHAs. The agent defaults to `deepseek/deepseek-flash`
-(DeepSeek V4.1 Flash); override `LLM_MODEL` to use another LiteLLM model.
-Repository clones are shallow; commits created by OpenHands are pushed to a new
-issue branch, so the target's full history is not required for remediation.
+tags rather than commit SHAs. The remediation workflow uses Google's
+`gemini/gemini-3.8-flash` through LiteLLM, with OpenHands prompt-cache markers
+disabled (`LLM_CACHING_PROMPT=false`) to avoid explicit cached-content creation
+that exceeds the Gemini free tier's zero cache-storage quota. The workflow
+retries transient LLM errors with up to eight attempts, exponential backoff,
+and a 60-second cap; retries cannot fix quota errors on their own. Gemini 3.8
+Flash has a 1,048,576-token input limit and a 65,536-token output limit. The
+Gemini API free tier currently includes free input and output tokens for
+eligible models, but request and token rate limits are project-specific; check
+AI Studio for the limits active on your project. Google may use free-tier
+content to improve its products. Disabling OpenHands cache markers prevents
+this workflow from requesting explicit Gemini cache storage; it does not change
+Google's separate implicit caching behavior or guarantee against other 429
+quota/rate-limit errors. Repository clones are shallow; commits
+created by OpenHands are pushed to a new issue branch, so the target's full
+history is not required for remediation.
 
 ### Phase 1 sensors
 
@@ -98,7 +110,10 @@ REPO=owner/name AUDIT_RECORD_DIR=records ./.github/scripts/audit-repo.sh
 | Secret | Purpose |
 | --- | --- |
 | `ORCHESTRATOR_PAT` | repo discovery, issue writes, checkouts, PR pushes |
-| `DEEPSEEK_API_KEY` | OpenHands model access in phase 2 (DeepSeek V4.1 Flash) |
+| `GEMINI_API_KEY` | Google AI Studio API key for OpenHands model access in phase 2 |
+
+Create or manage a Gemini API key in [Google AI Studio](https://aistudio.google.com/api-keys),
+then add it to this repository's Actions secrets as `GEMINI_API_KEY`.
 
 `ORCHESTRATOR_PAT` also needs read access to security alerts, otherwise phase 1
 reports "the token cannot read …". On a classic PAT that is the
