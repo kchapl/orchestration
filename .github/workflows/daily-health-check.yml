@@ -168,8 +168,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
           LLM_API_KEY: ${{ secrets.ORCHESTRATOR_PAT }}
-          LLM_MODEL: azure_ai/gpt-4o-mini
-          LLM_BASE_URL: https://models.inference.ai.azure.com
+          LLM_MODEL: github/gpt-4o-mini
           REPO: ${{ matrix.repo }}
           ISSUE: ${{ matrix.issue }}
         run: bash .orchestrator/.github/scripts/remediate-issue.sh
