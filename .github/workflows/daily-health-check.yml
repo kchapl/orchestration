@@ -167,8 +167,8 @@ jobs:
       - name: Run OpenHands remediation
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
-          LLM_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          LLM_MODEL: openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+          LLM_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LLM_MODEL: gemini/gemini-3.8-flash
           REPO: ${{ matrix.repo }}
           ISSUE: ${{ matrix.issue }}
         run: bash .orchestrator/.github/scripts/remediate-issue.sh
