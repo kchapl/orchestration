@@ -290,17 +290,37 @@ lockfile_map() {
   ' "$1"
 }
 
-# Flags "uses:" references that are not pinned: either a full commit SHA, or a
-# ref covered by the official workflow lockfile (.github/workflows/actions.lock).
-sensor_actions_pinning() {
-  local wf_dir="$TARGET_DIR/.github/workflows" hit file rest lineno text uses ref reason
-  local rel key lock_map=""
-  [[ -d $wf_dir ]] || return 0
+# Flatten the dependency section of actions.lock into "<pin key>\t<commit>"
+# lines, with the sha1- prefix stripped, so a commit pin can be traced back to
+# the ref it was locked from.
+lockfile_commit_map() {
+  awk '
+    /^dependencies:[[:space:]]*$/ { in_deps = 1; next }
+    /^[^[:space:]]/ { in_deps = 0 }
+    !in_deps { next }
+    /^[[:space:]]+[^[:space:]-][^:]*:[[:space:]]*$/ {
+      key = $0
+      sub(/^[[:space:]]+/, "", key)
+      sub(/:[[:space:]]*$/, "", key)
+      gsub(/["\047]/, "", key)
+      next
+    }
+    /^[[:space:]]+commit:/ {
+      commit = $0
+      sub(/^[[:space:]]+commit:[[:space:]]*/, "", commit)
+      gsub(/["\047]/, "", commit)
+      sub(/^sha1-/, "", commit)
+      if (key != "") print key "\t" commit
+    }
+  ' "$1"
+}
 
-  if [[ -f $wf_dir/actions.lock ]]; then
-    lock_map="$WORKDIR/lockfile-map"
-    lockfile_map "$wf_dir/actions.lock" >"$lock_map"
-  fi
+# Every external "uses:" reference, as "<workflow path>\t<line>\t<ref>" lines.
+# Local paths, docker:// images, and expression-based refs are not versioned
+# actions, so both workflow sensors ignore them.
+workflow_uses() {
+  local wf_dir="$TARGET_DIR/.github/workflows" hit file rest lineno text uses rel
+  [[ -d $wf_dir ]] || return 0
 
   while IFS= read -r hit; do
     file=${hit%%:*}
@@ -313,13 +333,28 @@ sensor_actions_pinning() {
     [[ -z $uses || $uses == ./* || $uses == docker://* || $uses == '$/'* ]] && continue
     # shellcheck disable=SC2016 # literal GitHub Actions expression syntax
     [[ $uses == *'${{'* ]] && continue
-
     rel=${file#"$TARGET_DIR"/}
+    printf '%s\t%s\t%s\n' "$rel" "$lineno" "$uses"
+  done < <(grep -rInE '^[[:space:]]*(-[[:space:]]+)?uses:' "$wf_dir" 2>/dev/null)
+}
+
+# Flags "uses:" references that are not pinned: either a full commit SHA, or a
+# ref covered by the official workflow lockfile (.github/workflows/actions.lock).
+sensor_actions_pinning() {
+  local rel lineno uses key ref reason lock_map=""
+
+  if [[ -f $TARGET_DIR/.github/workflows/actions.lock ]]; then
+    lock_map="$WORKDIR/lockfile-map"
+    lockfile_map "$TARGET_DIR/.github/workflows/actions.lock" >"$lock_map"
+  fi
+
+  while IFS=$'\t' read -r rel lineno uses; do
     if [[ -n $lock_map ]] && grep -Fxq "$rel"$'\t' "$lock_map"; then
       # Onboarded workflow: the runner executes the locked commit, so the ref in
       # the workflow only has to be present in the lockfile for this workflow.
-      key=$(printf '%s' "${uses%@*}" | cut -d/ -f1-2)"@""${uses##*@}"
-      grep -Fxq "$rel"$'\t'"$key" "$lock_map" && continue
+      # gh actions-lock lowercases pin keys, so compare them case-insensitively.
+      key=$(printf '%s' "${uses%@*}" | cut -d/ -f1-2 | tr '[:upper:]' '[:lower:]')"@""${uses##*@}"
+      grep -Fxiq "$rel"$'\t'"$key" "$lock_map" && continue
       reason="not in actions.lock for this workflow (run 'gh actions-lock')"
     elif [[ $uses != *@* ]]; then
       reason="no ref specified"
@@ -334,7 +369,141 @@ sensor_actions_pinning() {
     fi
     printf -- "- \`%s:%s\` — \`%s\` (%s)\n" "$rel" "$lineno" "$uses" "$reason" \
       >>"$WORKDIR/actions"
-  done < <(grep -rInE '^[[:space:]]*(-[[:space:]]+)?uses:' "$wf_dir" 2>/dev/null)
+  done < <(workflow_uses)
+}
+
+# Parse a release tag like "v7.0.1" into "7.0.1". Branch names and other refs
+# that carry no version fail, so they are simply not version-checked.
+parse_action_version() { # <tag>
+  local core=${1#v}
+  core=${core%%[-+]*}
+  [[ $core =~ ^([0-9]+)(\.([0-9]+))?(\.([0-9]+))?$ ]] || return 1
+  printf '%s.%s.%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]:-0}" "${BASH_REMATCH[5]:-0}"
+}
+
+# Latest published tag for an action, cached for the run. Releases are preferred
+# because a tag can exist without being announced; actions that publish only
+# tags fall back to the highest semver tag. Returns 3 when the action exposes no
+# version at all (a private or local action, or date-only tags), which is not a
+# sensor failure, and 1 for a real API error.
+action_latest_tag() { # <owner/repo>
+  local slug=$1 cache="$WORKDIR/action-latest" file out tag
+  file="$cache/${slug//\//__}"
+  if [[ -s $file ]]; then
+    cat "$file"
+    return 0
+  fi
+  mkdir -p "$cache" || return 1
+
+  if out=$(gh api "repos/$slug/releases/latest" --jq '.tag_name // ""' 2>&1); then
+    tag=$out
+  else
+    [[ $out == *"HTTP 404"* ]] || {
+      printf '%s\n' "${out%%$'\n'*}" >&2
+      return 1
+    }
+    tag=""
+  fi
+
+  if ! [[ $tag =~ ^v?[0-9] ]]; then
+    if ! out=$(gh api "repos/$slug/tags?per_page=100" --jq '.[].name' 2>&1); then
+      [[ $out == *"HTTP 404"* ]] && return 3
+      printf '%s\n' "${out%%$'\n'*}" >&2
+      return 1
+    fi
+    # sort -V keeps 1.10.0 above 1.9.0; prerelease tags are not "latest".
+    tag=$(printf '%s\n' "$out" | grep -E '^v?[0-9]+(\.[0-9]+){0,2}$' | sort -V | tail -n 1)
+  fi
+  [[ -n $tag ]] || return 3
+  printf '%s' "$tag" >"$file"
+  printf '%s' "$tag"
+}
+
+# Flags "uses:" refs that resolve to an older release than the action's latest.
+# A floating major tag (@v7) tracks its own major line, so it is only behind once
+# the action moves to a newer major; a full version must be the newest release.
+# Commit pins are resolved through actions.lock, so SHA-pinned workflows are
+# checked as well; an unresolvable pin is skipped rather than guessed at.
+sensor_actions_versions() {
+  local rel lineno uses key slug ref used latest used_v latest_v note pin rc
+  local failures=0 checked=0 lock="$TARGET_DIR/.github/workflows/actions.lock"
+  local u_major u_minor u_patch l_major l_minor l_patch
+  local -A locations=() pinned_ref=()
+  local -a order=()
+
+  if [[ -f $lock ]]; then
+    while IFS=$'\t' read -r key ref; do
+      [[ -n $ref ]] && pinned_ref["$ref"]=${key##*@}
+    done < <(lockfile_commit_map "$lock")
+  fi
+
+  while IFS=$'\t' read -r rel lineno uses; do
+    if [[ -n ${locations[$uses]:-} ]]; then
+      locations[$uses]+=", $rel:$lineno"
+    else
+      locations[$uses]="$rel:$lineno"
+      order+=("$uses")
+    fi
+  done < <(workflow_uses)
+  ((${#order[@]})) || return 0
+
+  for uses in "${order[@]}"; do
+    key=${uses%@*}
+    ref=${uses##*@}
+    # Reusable workflows are versioned by their repository's own scheme, which
+    # need not follow its releases; do not judge them against a release tag.
+    [[ $key == */.github/workflows/* ]] && continue
+    slug=$(cut -d/ -f1-2 <<<"$key")
+    [[ -n $slug ]] || continue
+    used=$ref
+    if [[ $ref =~ ^[0-9a-f]{40}$ ]]; then
+      used=${pinned_ref[$ref]:-}
+      [[ -n $used ]] || continue
+    fi
+    used_v=$(parse_action_version "$used") || continue
+
+    if latest=$(action_latest_tag "$slug"); then
+      :
+    else
+      rc=$?
+      ((rc == 3)) && continue
+      failures=$((failures + 1))
+      continue
+    fi
+    checked=$((checked + 1))
+    latest_v=$(parse_action_version "$latest") || continue
+
+    IFS=. read -r u_major u_minor u_patch <<<"$used_v"
+    IFS=. read -r l_major l_minor l_patch <<<"$latest_v"
+    note=""
+    if ((u_major < l_major)); then
+      if ((l_major - u_major == 1)); then
+        note="1 major version behind"
+      else
+        note="$((l_major - u_major)) major versions behind"
+      fi
+    elif ((u_major == l_major)) && ! [[ $used =~ ^v?[0-9]+$ ]]; then
+      # A major-only tag floats, so only compare full versions within a major.
+      if ((u_minor < l_minor)) || ((u_minor == l_minor && u_patch < l_patch)); then
+        note="an older $l_major.x release"
+      fi
+    fi
+    if [[ -n $note ]]; then
+      pin=""
+      [[ $ref =~ ^[0-9a-f]{40}$ ]] && pin=" (pinned at \`$used\`)"
+      # shellcheck disable=SC2016 # literal Markdown backticks in the issue body
+      printf -- '- `%s`%s is %s; latest is `%s` (`%s`)\n' \
+        "$uses" "$pin" "$note" "$latest" "${locations[$uses]}" \
+        >>"$WORKDIR/actions-versions"
+    fi
+  done
+
+  if ((failures > 0)); then
+    printf 'could not read the latest release for %d action(s)\n' "$failures" >&2
+    return 1
+  fi
+  ((checked > 0)) || return 3
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -354,12 +523,13 @@ print_section() { # <findings file> <fallback text> [note file]
 }
 
 render_body() {
-  local dep_n code_n loc_n act_n
+  local dep_n code_n loc_n act_n ver_n
 
   dep_n=$(count_lines "$WORKDIR/dependabot")
   code_n=$(count_lines "$WORKDIR/codeql")
   loc_n=$(count_lines "$WORKDIR/local")
   act_n=$(count_lines "$WORKDIR/actions")
+  ver_n=$(count_lines "$WORKDIR/actions-versions")
 
   printf '### 🛡️ Automated Repository Health Audit Findings\n\n'
   printf 'Repository: **%s**\n\n' "$REPO"
@@ -374,7 +544,9 @@ render_body() {
   printf '\n#### Dependency audit findings (%s)\n\n' "$loc_n"
   print_section "$WORKDIR/local" 'No vulnerable dependencies detected by local audits.'
   printf '\n#### GitHub Actions pinning (%s)\n\n' "$act_n"
-  print_section "$WORKDIR/actions" "All \`uses:\` references are pinned to commit SHAs."
+  print_section "$WORKDIR/actions" "Every \`uses:\` ref is a commit SHA or is covered by \`actions.lock\`."
+  printf '\n#### GitHub Actions versions (%s)\n\n' "$ver_n"
+  print_section "$WORKDIR/actions-versions" "Every \`uses:\` ref is on the latest release of its action."
 
   if [[ -s $WORKDIR/warnings ]]; then
     printf '\n#### Sensor warnings\n\n'
@@ -395,9 +567,10 @@ render_body() {
 [[ $DRY_RUN == 1 ]] || command -v gh >/dev/null 2>&1 || fail "gh CLI is not installed"
 
 WORKDIR=$(mktemp -d) || fail "could not create a temp directory"
-for s in dependabot codeql local local-npm local-pip actions warnings language archival \
-  dependabot_note codeql_note; do : >"$WORKDIR/$s"; done
-for s in dependabot codeql language archival npm-audit pip-audit actions-pinning; do
+for s in dependabot codeql local local-npm local-pip actions actions-versions warnings \
+  language archival dependabot_note codeql_note; do : >"$WORKDIR/$s"; done
+for s in dependabot codeql language archival npm-audit pip-audit actions-pinning \
+  actions-versions; do
   : >"$WORKDIR/log-$s"
   : >"$WORKDIR/warning-$s"
 done
@@ -428,14 +601,16 @@ wait "$pid_archival" || true
 run_sensor "npm audit" sensor_npm_audit >"$WORKDIR/log-npm-audit" 2>&1 & pid_npm_audit=$!
 run_sensor "pip-audit" sensor_pip_audit >"$WORKDIR/log-pip-audit" 2>&1 & pid_pip_audit=$!
 run_sensor "actions pinning" sensor_actions_pinning >"$WORKDIR/log-actions-pinning" 2>&1 & pid_actions=$!
+run_sensor "actions versions" sensor_actions_versions >"$WORKDIR/log-actions-versions" 2>&1 & pid_action_versions=$!
 wait "$pid_npm_audit" || true
 wait "$pid_pip_audit" || true
 wait "$pid_actions" || true
+wait "$pid_action_versions" || true
 
-for s in dependabot codeql language archival npm-audit pip-audit actions-pinning; do
+for s in dependabot codeql language archival npm-audit pip-audit actions-pinning actions-versions; do
   cat "$WORKDIR/log-$s"
 done
-for s in dependabot codeql language archival npm-audit pip-audit actions-pinning; do
+for s in dependabot codeql language archival npm-audit pip-audit actions-pinning actions-versions; do
   cat "$WORKDIR/warning-$s" >>"$WORKDIR/warnings"
 done
 cat "$WORKDIR/local-npm" "$WORKDIR/local-pip" >"$WORKDIR/local"
@@ -443,6 +618,7 @@ cat "$WORKDIR/local-npm" "$WORKDIR/local-pip" >"$WORKDIR/local"
 BODY=$(render_body)
 FINDINGS=$(( $(count_lines "$WORKDIR/dependabot") + $(count_lines "$WORKDIR/codeql") \
   + $(count_lines "$WORKDIR/local") + $(count_lines "$WORKDIR/actions") \
+  + $(count_lines "$WORKDIR/actions-versions") \
   + $(count_lines "$WORKDIR/language") + $(count_lines "$WORKDIR/archival") ))
 
 write_record || warn "could not write the audit record for $REPO"

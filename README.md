@@ -34,7 +34,10 @@ exits successfully even when a conversation errors, so the script inspects the
 streamed events for `ConversationErrorEvent` and fails that repository
 instead of opening an empty PR. After workflow edits it runs `gh actions-lock`
 to create or refresh `.github/workflows/actions.lock`, so action refs stay as
-tags rather than commit SHAs. Opening the draft PR does not finish the job:
+tags rather than commit SHAs. Version findings from phase 1 are applied in the
+same pass: a ref the issue reports as behind is moved to the release named
+there, or to that release's major tag when the ref floats on a major, and never
+to an older version. Opening the draft PR does not finish the job:
 the script then reads the pull request's check rollup and waits for every
 check to settle, failing its own run and naming each failed check with its log
 link when any of them fails. `PR_CHECK_TIMEOUT` (default 900 s) bounds the
@@ -90,6 +93,7 @@ that caching stays disabled for the agent and condenser.
 | npm advisories | `npm audit --json` (requires a lockfile) |
 | Python advisories | `pip-audit -r requirements*.txt` |
 | GitHub Actions pinning | `uses:` refs that are neither a 40-char commit SHA nor covered by `.github/workflows/actions.lock` |
+| GitHub Actions versions | `repos/{action}/releases/latest` for each `uses:` action, falling back to its tags |
 | Primary language | `repos/{repo}` metadata |
 | Archival candidate | no human-authored commit in over a year |
 
@@ -98,6 +102,18 @@ in `.github/workflows/actions.lock` counts as pinned when every `uses:` ref it
 contains has a pin entry, because Actions executes the locked commit. A ref
 missing from the lockfile, or a workflow that has not been onboarded at all, is
 still reported.
+
+Action versions are checked separately from pinning. Each `uses:` ref is
+compared with its action's latest published release, so the issue names the
+version to move to instead of only saying the workflow is stale. A floating
+major tag (`@v7`) tracks its own major line and is reported only once the action
+moves to a newer major; a full version such as `@v4.4.0` must be the newest
+release in its major. Commit pins are resolved back to the ref they were locked
+from through `actions.lock`, so SHA-pinned workflows are checked too; a ref with
+no resolvable version (a branch, a private action, or a repository that publishes
+no version tags) is skipped rather than guessed at. Each action is queried once
+per run and the result is cached, so a repository with a dozen workflows costs
+one API call per distinct action.
 
 Every sensor runs in isolation: a sensor that fails (missing tool, API error) is
 reported as a warning and in the issue body, and the other sensors still run.
