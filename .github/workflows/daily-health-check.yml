@@ -21,8 +21,7 @@ jobs:
   discover-repos:
     runs-on: ubuntu-latest
     outputs:
-     # matrix: ${{ steps.set-matrix.outputs.matrix }}
-      matrix: '{"repo": ["kchapl/book-lamp"]}'
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - name: Fetch repository list via GitHub API
         id: set-matrix
