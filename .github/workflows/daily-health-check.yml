@@ -64,12 +64,12 @@ jobs:
     steps:
       # The audit logic lives in this repo so it can be run and tested locally.
       - name: Checkout health-check tooling
-        uses: actions/checkout@v4.4.0
+        uses: actions/checkout@v7.0.1
         with:
           path: .orchestrator
 
       - name: Checkout target repository
-        uses: actions/checkout@v4.4.0
+        uses: actions/checkout@v7.0.1
         with:
           repository: ${{ matrix.repo }}
           token: ${{ secrets.ORCHESTRATOR_PAT }}
@@ -85,7 +85,7 @@ jobs:
 
       - name: Upload audit record
         if: always()
-        uses: actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: audit-record-${{ strategy.job-index }}
           path: ${{ github.workspace }}/audit-records
@@ -102,14 +102,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout health-check tooling
-        uses: actions/checkout@v4.4.0
+        uses: actions/checkout@v7.0.1
         with:
           path: .orchestrator
 
       # Advisory input only: a run with no records still renders a summary.
       - name: Collect audit records
         continue-on-error: true
-        uses: actions/download-artifact@v4.3.0
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: audit-record-*
           path: audit-records
@@ -129,7 +129,7 @@ jobs:
       has_work: ${{ steps.remediation.outputs.has_work }}
     steps:
       - name: Checkout health-check tooling
-        uses: actions/checkout@v4.4.0
+        uses: actions/checkout@v7.0.1
         with:
           path: .orchestrator
 
@@ -161,7 +161,7 @@ jobs:
 
     steps:
       - name: Checkout health-check tooling
-        uses: actions/checkout@v4.4.0
+        uses: actions/checkout@v7.0.1
         with:
           path: .orchestrator
 
