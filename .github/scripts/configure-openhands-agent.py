@@ -13,7 +13,7 @@ from openhands_cli.utils import get_default_cli_agent
 
 def main() -> None:
     api_key = os.environ["LLM_API_KEY"]
-    model = os.environ.get("LLM_MODEL", "gemini/gemini-3.8-flash")
+    model = os.environ.get("LLM_MODEL", "gemini/gemini-3.5-flash-lite")
     persistence_dir = Path(os.environ["OPENHANDS_PERSISTENCE_DIR"])
 
     llm = LLM(

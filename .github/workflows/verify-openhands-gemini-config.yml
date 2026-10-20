@@ -24,7 +24,7 @@ jobs:
       - name: Generate and verify temporary agent config
         env:
           LLM_API_KEY: test-config-only-not-a-real-key
-          LLM_MODEL: gemini/gemini-3.8-flash
+          LLM_MODEL: gemini/gemini-3.5-flash-lite
           OPENHANDS_PERSISTENCE_DIR: ${{ runner.temp }}/openhands-config-check
         run: |
           set -euo pipefail

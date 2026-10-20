@@ -35,14 +35,29 @@ streamed events for `ConversationErrorEvent` and fails that repository
 instead of opening an empty PR. After workflow edits it runs `gh actions-lock`
 to create or refresh `.github/workflows/actions.lock`, so action refs stay as
 tags rather than commit SHAs. The remediation workflow uses Google's
-`gemini/gemini-3.8-flash` through LiteLLM. It writes a private, temporary
+`gemini/gemini-3.5-flash-lite` through LiteLLM — a stable Flash-Lite model
+that Google names for new free-tier projects and that targets high-throughput
+agent workloads. It writes a private, temporary
 OpenHands agent configuration with prompt caching disabled for both the agent
 and its condenser, avoiding explicit cached-content creation that exceeds the
 Gemini free tier's zero cache-storage quota. The file is removed after the run.
 The workflow retries transient LLM errors with up to eight attempts,
 exponential backoff, and a 60-second cap; retries cannot fix quota errors on
-their own. Gemini 3.8 Flash has a 1,048,576-token input limit and a
-65,536-token output limit. The
+their own. **The free-tier daily request quota is the binding constraint on
+phase 2.** One remediation conversation needs dozens of model calls, so the
+model has to have a daily request allowance that covers a full run; the free
+tier of `gemini-3.8-flash` allows only 20 requests per day per project per
+model and dies mid-conversation with `429 RESOURCE_EXHAUSTED`. Flash-Lite
+models carry a far larger daily allowance on the same free tier, which is why
+phase 2 runs on `gemini-3.5-flash-lite`. Google does not publish per-model
+free-tier RPD figures — the error names the exhausted limit, and AI Studio
+shows the limits in force for the project that owns the key. The quota resets
+at midnight Pacific. When a run does hit the cap, `remediate-issue.sh` reports
+the exhausted limit and the reset hint instead of a generic failure, and the
+workflow serializes runs with `concurrency` so overlapping manual runs cannot
+spend the same budget twice. To move the ceiling again, set `LLM_MODEL` to
+another model with a free tier row. Gemini 3.5 Flash-Lite has a 1,048,576-token
+input limit and a 65,536-token output limit. The
 Gemini API free tier currently includes free input and output tokens for
 eligible models, but request and token rate limits are project-specific; check
 AI Studio for the limits active on your project. Google may use free-tier

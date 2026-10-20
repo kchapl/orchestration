@@ -5,6 +5,12 @@ on:
    # - cron: '0 8 * * *' # Daily at 08:00 UTC
   workflow_dispatch: # Allows manual run from GitHub Actions UI
 
+# Phase 2 shares one LLM quota across every repository, so overlapping manual
+# runs would spend the same daily budget twice. Queue them instead.
+concurrency:
+  group: health-check
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -150,6 +156,9 @@ jobs:
       # backlog cannot consume every runner and API quota in a single burst.
       max-parallel: 1
       matrix: ${{ fromJson(needs.find-remediation.outputs.matrix) }}
+    # An agent conversation can stall indefinitely; cap it so one repository
+    # cannot hold the serialized queue until the 6-hour job limit.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout health-check tooling
@@ -168,7 +177,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.ORCHESTRATOR_PAT }}
           LLM_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          LLM_MODEL: gemini/gemini-3.8-flash
+          LLM_MODEL: gemini/gemini-3.5-flash-lite
           LLM_NUM_RETRIES: "8"
           LLM_RETRY_MIN_WAIT: "5"
           LLM_RETRY_MAX_WAIT: "60"
