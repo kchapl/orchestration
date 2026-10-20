@@ -14,7 +14,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 TARGET="$WORKSPACE/remediation/${REPO//\//__}"
 BRANCH="health/fix-issue-$ISSUE"
 
-REMEDIATION_PROMPT="Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, dependency updates, and GitHub Actions workflow issues mentioned. If workflows are flagged, update action versions in .github/workflows/*.yml to the latest releases and keep tag refs (for example @v4), never commit SHAs. Do not hand-edit .github/workflows/actions.lock: the pipeline runs 'gh actions-lock' after your edits to create or refresh it. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Run native test suites ('sbt test', 'npm test', 'pytest', or 'shellcheck *.sh') to verify cleanly."
+REMEDIATION_PROMPT="Read .issue-context.md and address all technical vulnerabilities, CodeQL warnings, dependency updates, and GitHub Actions workflow issues mentioned. If the issue reports unpinned workflows, rewrite only those refs as the newest release tag of the action's current major version (for example @v7); never move a ref to an older major and never commit SHAs. If the issue reports no pinning findings, leave workflow files alone. Do not hand-edit .github/workflows/actions.lock: the pipeline runs 'gh actions-lock' after your edits to create or refresh it. If .issue-context.md indicates the repo is an Archival Candidate, ignore routine package updates. Your work is only accepted when CI passes, so read .github/workflows/*.yml and run every command those jobs run -- install, lint, formatter, type checker, and tests -- not just the test suite."
 
 ensure_openhands() {
   export PATH="$HOME/.local/bin:$PATH"
@@ -61,6 +61,80 @@ report_quota_exhaustion() {
   echo "  GEMINI_API_KEY project in AI Studio, or point LLM_MODEL at a model with"
   echo "  a larger free-tier daily limit; rerunning now cannot succeed."
   return 0
+}
+
+# Opening the pull request is not the end of the job: the target repository's
+# own CI has to agree with it. gh pr checks exits non-zero while any check is
+# still pending, so read the rollup and classify each entry instead of trusting
+# that exit status.
+pr_check_rollup() {
+  local pr=$1
+  gh pr view "$pr" --repo "$REPO" --json statusCheckRollup --jq '
+    def bucket:
+      if .state == "SUCCESS" or .state == "NEUTRAL" or .state == "SKIPPED" then "ok"
+      elif .state == "PENDING" or .state == "EXPECTED"
+        or .state == "QUEUED" or .state == "IN_PROGRESS" then "pending"
+      else "fail" end;
+    [(.statusCheckRollup // [])[]
+      | {
+          name: (.name // .context // "check"),
+          link: (.detailsUrl // .targetUrl // ""),
+          state: (if .__typename == "StatusContext" then .state
+                  elif .status == "COMPLETED" then .conclusion
+                  else "PENDING" end)
+        }
+      | {name, link, state, bucket: bucket}]
+  '
+}
+
+wait_for_pr_checks() {
+  local pr=$1 timeout=${PR_CHECK_TIMEOUT:-900} interval=${PR_CHECK_INTERVAL:-15}
+  local grace=${PR_CHECK_START_GRACE:-120}
+  local start=$SECONDS deadline checks total pending failed
+  deadline=$((start + timeout))
+
+  while :; do
+    if ! checks=$(pr_check_rollup "$pr"); then
+      echo "::error::Could not read the checks on $REPO pull request #$pr"
+      return 1
+    fi
+    total=$(jq 'length' <<<"$checks")
+    if ((total == 0)); then
+      # A repository can take a few seconds to register its first check run,
+      # but one without CI never registers any; do not burn the whole budget.
+      if (((SECONDS - start) >= grace)); then
+        echo "::warning::$REPO pull request #$pr reported no checks; nothing to verify"
+        return 0
+      fi
+      echo "Waiting for checks on $REPO pull request #$pr to be registered..."
+      sleep "$interval"
+      continue
+    fi
+
+    pending=$(jq '[.[] | select(.bucket == "pending")] | length' <<<"$checks")
+    if ((pending > 0)); then
+      if ((SECONDS >= deadline)); then
+        echo "::error::Checks on $REPO pull request #$pr were still running after ${timeout}s"
+        jq -r '.[] | select(.bucket == "pending")
+          | "  still running: \(.name) \(.link)"' <<<"$checks"
+        return 1
+      fi
+      echo "$pending of $total checks still running on pull request #$pr..."
+      sleep "$interval"
+      continue
+    fi
+
+    failed=$(jq '[.[] | select(.bucket == "fail")] | length' <<<"$checks")
+    if ((failed > 0)); then
+      echo "::error::$failed of $total checks failed on $REPO pull request #$pr"
+      jq -r '.[] | select(.bucket == "fail")
+        | "  failed: \(.name) (\(.state)) \(.link)"' <<<"$checks"
+      return 1
+    fi
+
+    echo "All $total checks passed on $REPO pull request #$pr"
+    return 0
+  done
 }
 
 run_openhands() {
@@ -165,6 +239,8 @@ if [[ -n $(git -C "$TARGET" status --porcelain) ]]; then
   git -C "$TARGET" commit -m "fix(health): automated OpenHands resolution for issue #$ISSUE"
   git -C "$TARGET" push origin "$BRANCH"
 
+  # The body must not claim verification the job has not done; the check gate
+  # below is what turns this draft into a verified pull request.
   gh pr create \
     --repo "$REPO" \
     --head "$BRANCH" \
@@ -174,14 +250,22 @@ Generated by OpenHands using **\`${LLM_MODEL#gemini/}\`**.
 
 **Closes #$ISSUE**
 
-**Verification Status:**
-- [x] Examined requirements from Issue #$ISSUE
-- [x] Audited and updated GitHub Actions workflows
-- [x] Applied safe dependency and code vulnerability patches
-- [x] Verified native build and unit test execution
-
-Please inspect the diff and approve." \
+**Verification:** the health-check workflow that opened this draft waits for
+every check on this pull request and fails its own run if any of them fails.
+A failing check here therefore means the remediation is unfinished, not that
+CI is flaky. Please inspect the diff before approving." \
     --draft
+
+  if ! pr=$(gh pr view "$BRANCH" --repo "$REPO" --json number --jq .number); then
+    echo "::error::Opened a pull request for $BRANCH but could not read its number"
+    exit 1
+  fi
+  echo "Opened https://github.com/$REPO/pull/$pr"
+  wait_for_pr_checks "$pr"
+  if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then
+    printf '### %s\n\nPull request #%s for issue #%s passed every check.\n' \
+      "$REPO" "$pr" "$ISSUE" >>"$GITHUB_STEP_SUMMARY"
+  fi
 else
   echo "OpenHands completed without generating code diffs for issue #$ISSUE on $REPO."
 fi

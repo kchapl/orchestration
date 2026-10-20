@@ -34,7 +34,17 @@ exits successfully even when a conversation errors, so the script inspects the
 streamed events for `ConversationErrorEvent` and fails that repository
 instead of opening an empty PR. After workflow edits it runs `gh actions-lock`
 to create or refresh `.github/workflows/actions.lock`, so action refs stay as
-tags rather than commit SHAs. The remediation workflow uses Google's
+tags rather than commit SHAs. Opening the draft PR does not finish the job:
+the script then reads the pull request's check rollup and waits for every
+check to settle, failing its own run and naming each failed check with its log
+link when any of them fails. `PR_CHECK_TIMEOUT` (default 900 s) bounds the
+wait, `PR_CHECK_INTERVAL` (default 15 s) sets the poll period, and
+`PR_CHECK_START_GRACE` (default 120 s) covers the delay before the first check
+is registered. A repository whose pull requests report no checks at all is
+noted and allowed through, since there is nothing to verify. The agent is
+also told to read `.github/workflows/*.yml` and run the lint, formatter, type
+checker, and tests those jobs run, so a green PR is the expected outcome
+rather than a lucky one. The remediation workflow uses Google's
 `gemini/gemini-3.5-flash-lite` through LiteLLM — a stable Flash-Lite model
 that Google names for new free-tier projects and that targets high-throughput
 agent workloads. It writes a private, temporary
