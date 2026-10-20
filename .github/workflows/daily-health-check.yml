@@ -1,9 +1,9 @@
 name: Two-Phase Polyglot Health Check
 
 on:
-  #schedule:
-   # - cron: '0 8 * * *' # Daily at 08:00 UTC
-  workflow_dispatch: # Allows manual run from GitHub Actions UI
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
 
 # Phase 2 shares one LLM quota across every repository, so overlapping manual
 # runs would spend the same daily budget twice. Queue them instead.
