@@ -2,7 +2,8 @@ name: Two-Phase Polyglot Health Check
 
 on:
   schedule:
-    - cron: '0 8 * * *'
+    - cron: '0 10 * * *'
+    - timezone: Europe/London
   workflow_dispatch:
 
 # Phase 2 shares one LLM quota across every repository, so overlapping manual
