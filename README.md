@@ -162,11 +162,13 @@ Actions runs. Edit the Markdown, never the lock file.
   `owner/name`, blank discovers every non-archived, non-fork repository with
   the same filter the pipeline uses) and `limit` (maximum repositories per run,
   `0` = no cap).
-- **Engine:** `agy` (Google Antigravity CLI) on `gemini-3.5-flash-lite` — the
-  same Flash-Lite model phase 2 uses — pinned to the native release this
-  compiler verifies (`1.3.3`; the upstream catalog lists `1.3.6`, so a newer
-  gh-aw compiler can move the pin). It authenticates with `GEMINI_API_KEY`;
-  `GOOGLE_API_KEY`, ADC, WIF, and Vertex AI are not supported by this engine.
+- **Engine:** `gemini` (Google Gemini CLI, pinned to `0.64.0`) on
+  `gemini-3.5-flash-lite` — the same Flash-Lite model phase 2 uses. Agy was the
+  first choice, but its native CLI exposes only Gemini 3.8, 3.7, and 3.6 Flash
+  plus 3.1 Pro, with no Flash-Lite slug in any release gh-aw can install, and
+  the run fails at model selection before inference. The Gemini engine keeps
+  the model; it is deprecated upstream in favour of Agy but still supported.
+  It authenticates with `GEMINI_API_KEY`.
 - **Behavior:** a deterministic `prepare-targets` job resolves the repository
   list, publishes it as the `health-audit-targets` artifact, and creates the
   `automated-health` label where it is missing, because the remediation
@@ -179,9 +181,10 @@ Actions runs. Edit the Markdown, never the lock file.
 - **Writes:** the agent job is read-only. Issues are created or updated by the
   isolated safe-outputs job with `ORCHESTRATOR_PAT`, targeted at the audited
   repository.
-- **Security:** threat detection is disabled because the Agy engine has no
-  detector pass; the agent job holds no write permission and every write is
-  staged through safe outputs. The audit never modifies source files.
+- **Security:** threat detection is disabled because the detector only runs on
+  the Copilot engine and this repository configures no Copilot credentials; the
+  agent job holds no write permission and every write is staged through safe
+  outputs. The audit never modifies source files.
 - **Cost:** one agent conversation covers the whole run, so `limit` bounds how
   many repositories one dispatch handles; each repository costs model turns
   against the Gemini free-tier request quota. The agentic step is capped at 45

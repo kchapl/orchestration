@@ -34,18 +34,20 @@ permissions:
   security-events: read
   vulnerability-alerts: read
 
+# Agy (the native Antigravity CLI) only exposes Gemini 3.8/3.7/3.6 Flash and
+# 3.1 Pro, with no Flash-Lite slug in any release gh-aw can install. Keep the
+# Flash-Lite model the pipeline already runs on by using the Gemini engine.
 engine:
-  id: agy
+  id: gemini
   model: gemini-3.5-flash-lite
-  # Newest native release this gh-aw compiler verifies a checksum for.
-  version: "1.3.3"
+  version: "0.64.0"
 
 # The audit reads other repositories, so the agent needs the orchestrator PAT
 # rather than the workflow's repository-scoped token.
 tools:
   edit:
-  # npm audit and pip-audit run in the agent workspace, so shell access cannot
-  # be narrowed; Agy rejects per-command bash restrictions anyway.
+  # npm audit and pip-audit run in the agent workspace against dynamically
+  # fetched manifests, so shell access cannot be narrowed to a fixed list.
   bash: true
   github:
     toolsets: [repos, issues, code_security, dependabot]
@@ -65,9 +67,10 @@ safe-outputs:
     target-repo: "*"
     body:
     max: 50
-  # The Agy engine has no threat-detection pass (its documented gate disables
-  # the Copilot detector), and the agent job holds no write permission: every
-  # write below happens in the isolated safe-outputs job.
+  # The detector runs on the Copilot engine and needs COPILOT_GITHUB_TOKEN,
+  # which this repository does not configure; leaving it on would fail the job
+  # before any safe output is applied. The agent job is read-only and every
+  # write below happens in the isolated safe-outputs job instead.
   threat-detection: false
 
 timeout-minutes: 45
