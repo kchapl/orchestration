@@ -178,11 +178,45 @@ You are the on-demand, agentic counterpart of
 `.github/workflows/daily-health-check.yml`. That workflow discovers the
 account's repositories, runs deterministic audit sensors, and opens one
 `automated-health` issue per repository that has actionable findings. You do
-the same audit yourself, with GitHub tools and shell commands, and publish the
+the same audit yourself with the read-only GitHub MCP tools, and publish the
 result through safe outputs.
 
 This run was dispatched manually, so there is no schedule and no previous run
 to build on: resolve the target list and audit it from scratch every time.
+
+## Tools
+
+The sandbox holds no GitHub credentials. `gh` is installed but deliberately
+unauthenticated, and `api.github.com` does not resolve from inside the sandbox,
+so neither can read anything: never retry them, and never run
+`.github/scripts/audit-repo.sh`, which shells out to `gh`. An unauthenticated
+read is a hard failure, not a clean repository.
+
+All GitHub reads go through the read-only GitHub MCP server, which
+authenticates with the orchestrator PAT and can read any public repository.
+Depending on how the engine exposes it, that is either a native tool in your
+inventory (`list_dependabot_alerts`, `get_file_contents`, ...) or the `github`
+command on `PATH`, which serves the same 23 tools:
+
+```bash
+github --help
+github list_dependabot_alerts --help
+github list_dependabot_alerts '{"owner": "kchapl", "repo": "orchestration", "state": "open"}'
+```
+
+The `github` command is the form this sandbox always provides, so prefer it.
+`github <tool> --help` prints the schema-derived parameters for a single tool.
+Pass `fields` on list and search calls to keep responses small, and stop after
+a few hundred results for one repository.
+
+Writes go only through the safe outputs (`create_issue`, `update_issue`,
+`noop`, `report_incomplete`).
+
+Before auditing anything, prove the read path with one harmless call, for
+example `github list_branches '{"owner": "kchapl", "repo": "orchestration"}'`.
+If neither form works, stop and call `report_incomplete` with the error you
+saw; do not fall back to `gh`, do not invent findings, and never report a
+repository as clean.
 
 ## Targets
 
@@ -209,54 +243,65 @@ the workspace, and created the `automated-health` label on each target.
 
 ## Per-repository checks
 
-Run these checks for each target. Treat a feature that is simply not enabled for
-a repository - code scanning with no analyses, Dependabot alerts switched off -
-as a note, not a warning; it says nothing about the repository's health. Report
-any other failure as a sensor warning and continue with the remaining checks.
+Run these checks for each target, using the tool named in each one. Treat a
+feature that is simply not enabled for a repository - code scanning with no
+analyses, Dependabot alerts switched off - as a note, not a warning; it says
+nothing about the repository's health. Report any other failure as a sensor
+warning and continue with the remaining checks.
 
-1. **Dependabot alerts** - open alerts, with severity, package, summary, and
-   alert link. If the token cannot read alerts, record the warning that the
-   token needs `security_events` (classic PAT) or the matching read permission
-   on a fine-grained PAT.
-2. **Code scanning alerts** - open alerts, with severity, rule id, description,
-   and file path. Missing analyses are a note ("not enabled for this
-   repository, or has no analyses yet"), not a warning.
+1. **Dependabot alerts** - `list_dependabot_alerts` with
+   `{"owner": "<owner>", "repo": "<name>", "state": "open"}`: open alerts
+   with severity, package, summary, and alert link. If the call is rejected for
+   permissions, record the warning that the token needs `security_events`
+   (classic PAT) or the matching read permission on a fine-grained PAT.
+2. **Code scanning alerts** - `list_code_scanning_alerts` with
+   `state: "open"`, called once with `severity: "critical,high"` and once with
+   `severity: "medium,low"` so each response stays bounded: severity, rule id,
+   description, and file path. Missing analyses ("not enabled for this
+   repository, or has no analyses yet") are a note, not a warning.
 3. **npm advisories** - only when the repository has `package-lock.json` or
-   `npm-shrinkwrap.json`. Fetch the manifest and lockfile into a temporary
-   directory outside the checkout, then run `npm audit --json` there. Report every finding
-   whose severity is not `info` with its severity, package, and advisory title.
-   A lockfile that cannot be parsed is a sensor warning.
+   `npm-shrinkwrap.json`; list the repository root with `get_file_contents` to
+   find them. Fetch `package.json` and the lockfile with `get_file_contents`,
+   decode the base64 `content` field into a temporary directory outside the
+   checkout, and run `npm audit --json` there. Report every finding whose
+   severity is not `info` with its severity, package, and advisory title. A
+   lockfile that cannot be parsed is a sensor warning.
 4. **Python advisories** - only when the repository has `requirements*.txt`.
-   Fetch each file and run `pip-audit -r <file> --format=json`. If `pip-audit`
-   is not on `PATH`, install it with `python3 -m pip install --user pip-audit`;
-   if that fails, report a sensor warning instead of guessing. Report each
-   vulnerable package with its fix versions (or "no fix available") and the
-   advisory id.
-5. **GitHub Actions pinning** - read `.github/workflows/*.yml` (and `.yaml`)
-   and collect every external `uses:` reference. A reference is pinned when it
-   is a 40-character commit SHA, or when it appears in that workflow's entry in
+   Fetch each file the same way and run `pip-audit -r <file> --format=json`. If
+   `pip-audit` is not on `PATH`, install it with
+   `python3 -m pip install --user pip-audit`; if that fails, report a sensor
+   warning instead of guessing. Report each vulnerable package with its fix
+   versions (or "no fix available") and the advisory id.
+5. **GitHub Actions pinning** - list `.github/workflows` with
+   `get_file_contents` and read every `*.yml` and `*.yaml` file in it. Collect
+   every external `uses:` reference. A reference is pinned when it is a
+   40-character commit SHA, or when it appears in that workflow's entry in
    `.github/workflows/actions.lock` (the workflow is onboarded and the locked
    commit is what Actions executes). Local paths, `docker://` images, and
    expression-based refs are not versioned actions and are ignored. Report each
    unpinned reference with its file, line number, and the reason (`not in
    actions.lock for this workflow`, `no ref specified`, or `ref '<ref>' is not
    a commit SHA`).
-6. **GitHub Actions versions** - for each distinct `uses:` action, look up its
-   latest published release once per run and cache the answer. A floating major
-   tag such as `@v7` tracks its own major line and is reported only once the
-   action has moved to a newer major; a full version such as `@v4.4.0` must be
-   the newest release in its major. Resolve commit pins back to the ref they
-   were locked from through `actions.lock`; skip a reference whose version
-   cannot be resolved. Report the version to move to, never an older version,
-   and note when the current ref is a commit pin.
-7. **Primary language** - read it from repository metadata. The supported set
-   is `Python Shell TypeScript Scala JavaScript Unspecified`. A language outside
+6. **GitHub Actions versions** - for each distinct `uses: owner/repo@ref`, call
+   `get_latest_release` for `owner/repo` once per run and cache the answer. A
+   floating major tag such as `@v7` tracks its own major line and is reported
+   only once the action has moved to a newer major; a full version such as
+   `@v4.4.0` must be the newest release in its major. Resolve commit pins back
+   to the ref they were locked from through `actions.lock`; skip a reference
+   whose version cannot be resolved. Report the version to move to, never an
+   older version, and note when the current ref is a commit pin.
+7. **Primary language** - call `search_repositories` with
+   `{"query": "<owner>/<name> in:fullname"}` and read `language` from the one
+   result. The supported set is
+   `Python Shell TypeScript Scala JavaScript Unspecified`. A language outside
    that set is a note that remediation can still edit files but native test
    suites may need a custom toolchain.
-8. **Archival candidate** - inspect recent commit history. The repository is a
-   candidate when no commit in the last 100 has a human author (a non-`User`
-   author type, or a login containing `bot`, does not count) in the last year.
-   Report the date of the last human commit, or that there was none.
+8. **Archival candidate** - call `list_commits` with
+   `{"owner": "<owner>", "repo": "<name>", "per_page": 100}` and inspect the
+   authors. The repository is a candidate when no commit in the last 100 has a
+   human author (a non-`User` author type, or a login containing `bot`, does
+   not count) in the last year. Report the date of the last human commit, or
+   that there was none.
 
 Bound the work: stop a repository's remaining checks after repeated rate-limit
 or network failures, and do not retry the same failing call more than twice.
@@ -270,10 +315,11 @@ warnings alone do not justify an issue.
 
 - Title: `🛡️ [Health Audit] Security Vulnerabilities & Dependency Maintenance`
 - Label: `automated-health`
-- Before creating, list the repository's open issues and look for an existing
-  issue with the `automated-health` label. Update that issue's body instead of
-  creating a duplicate; the pipeline treats the first open issue as the
-  remediation target.
+- Before creating, call `list_issues` with
+  `{"owner": "<owner>", "repo": "<name>", "labels": "automated-health", "state": "OPEN"}`
+  and look for an existing issue with the `automated-health` label. Update that
+  issue's body instead of creating a duplicate; the pipeline treats the first
+  open issue as the remediation target.
 - Target the audited repository, never this repository, when creating or
   updating.
 - Omit the issue entirely when the repository has no findings.
@@ -334,6 +380,7 @@ invent findings, links, counts, or severity; if a value is unknown, say so.
 
 Write a short step summary: the repositories audited, the repositories with
 findings, the issues created or updated, and the repositories skipped by
-`limit` or by an access failure. Use the `noop` output only when you audited
-the targets and no repository needed an issue, so the run records a clean
-result instead of an empty output.
+`limit`, by an access failure, or because the run reached its time budget. A
+target you did not finish is skipped, never clean. Use the `noop` output only
+when you audited the whole list and no repository needed an issue, so the run
+records a clean result instead of an empty output.
