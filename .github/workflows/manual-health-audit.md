@@ -28,8 +28,9 @@ concurrency:
 
 permissions:
   contents: read
-  # Read scopes for the GitHub toolsets; the tools themselves authenticate with
-  # ORCHESTRATOR_PAT so they can read the audited repositories too.
+  # The toolsets below declare the read scopes this workflow needs. The agent's
+  # gh reads authenticate through the CLI proxy with ORCHESTRATOR_PAT, which is
+  # also what lets it read the audited repositories.
   issues: read
   security-events: read
   vulnerability-alerts: read
@@ -50,21 +51,26 @@ sandbox:
   agent:
     id: awf
     version: v0.28.73
-    # The compiler's digest table only covers its bundled version, so the three
-    # roles this workflow uses are pinned here from the v0.28.73 containers.txt.
+    # The compiler's digest table only covers its bundled version, so every
+    # role this workflow uses is pinned here from the v0.28.73 containers.txt.
+    # cliProxy carries the gh-proxy relay, which is what authenticates `gh`.
     images:
       agent: ghcr.io/github/gh-aw-firewall/agent:0.28.73@sha256:3904bccb0693f73bc19fb8a82d5c9cd95040ae96d99e881967f8ca212d9d6a1a
       api-proxy: ghcr.io/github/gh-aw-firewall/api-proxy:0.28.73@sha256:a1860172a0d22b5f8190bde334794b5ed7dd93dd79583d09fbce8fe8c1751a56
+      cli-proxy: ghcr.io/github/gh-aw-firewall/cli-proxy:0.28.73@sha256:1135787f7355d6a71df0a8327f39d3fa66dc3d7868894fd1cc3e5e95bdd08762
       squid: ghcr.io/github/gh-aw-firewall/squid:0.28.73@sha256:fa0620bd3506ee69e450426a9f2ac8b13a81544604c244d2de2b0106eb03809f
 
 # The audit reads other repositories, so the agent needs the orchestrator PAT
-# rather than the workflow's repository-scoped token.
+# rather than the workflow's repository-scoped token. gh-proxy hands `gh` a
+# pre-authenticated route through the host CLI proxy, so the PAT itself never
+# enters the sandbox and the agent uses the same gh commands the sensors use.
 tools:
   edit:
   # npm audit and pip-audit run in the agent workspace against dynamically
   # fetched manifests, so shell access cannot be narrowed to a fixed list.
   bash: true
   github:
+    mode: gh-proxy
     toolsets: [repos, issues, code_security, dependabot]
     github-token: ${{ secrets.ORCHESTRATOR_PAT }}
 
@@ -178,45 +184,32 @@ You are the on-demand, agentic counterpart of
 `.github/workflows/daily-health-check.yml`. That workflow discovers the
 account's repositories, runs deterministic audit sensors, and opens one
 `automated-health` issue per repository that has actionable findings. You do
-the same audit yourself with the read-only GitHub MCP tools, and publish the
-result through safe outputs.
+the same audit yourself with `gh` reads and local dependency audits, and
+publish the result through safe outputs.
 
 This run was dispatched manually, so there is no schedule and no previous run
 to build on: resolve the target list and audit it from scratch every time.
 
 ## Tools
 
-The sandbox holds no GitHub credentials. `gh` is installed but deliberately
-unauthenticated, and `api.github.com` does not resolve from inside the sandbox,
-so neither can read anything: never retry them, and never run
-`.github/scripts/audit-repo.sh`, which shells out to `gh`. An unauthenticated
-read is a hard failure, not a clean repository.
-
-All GitHub reads go through the read-only GitHub MCP server, which
-authenticates with the orchestrator PAT and can read any public repository.
-Depending on how the engine exposes it, that is either a native tool in your
-inventory (`list_dependabot_alerts`, `get_file_contents`, ...) or the `github`
-command on `PATH`, which serves the same 23 tools:
+GitHub reads run through `gh`, which this workflow authenticates through the
+host CLI proxy: the orchestrator PAT never enters the sandbox, and the proxy
+applies the same public-repository guard policy as the rest of the pipeline.
 
 ```bash
-github --help
-github list_dependabot_alerts --help
-github list_dependabot_alerts '{"owner": "kchapl", "repo": "orchestration", "state": "open"}'
+gh api repos/<owner>/<repo>
+gh api --paginate "repos/<owner>/<repo>/dependabot/alerts?state=open"
 ```
 
-The `github` command is the form this sandbox always provides, so prefer it.
-`github <tool> --help` prints the schema-derived parameters for a single tool.
-Pass `fields` on list and search calls to keep responses small, and stop after
-a few hundred results for one repository.
-
-Writes go only through the safe outputs (`create_issue`, `update_issue`,
-`noop`, `report_incomplete`).
+`curl` cannot reach `api.github.com` from the sandbox - only the proxy can - so
+never fall back to it. A failed or rejected `gh` call is a hard failure for that
+repository, never a clean result. Writes go only through the safe outputs
+(`create_issue`, `update_issue`, `noop`, `report_incomplete`).
 
 Before auditing anything, prove the read path with one harmless call, for
-example `github list_branches '{"owner": "kchapl", "repo": "orchestration"}'`.
-If neither form works, stop and call `report_incomplete` with the error you
-saw; do not fall back to `gh`, do not invent findings, and never report a
-repository as clean.
+example `gh api repos/<owner>/<repo>`. If it fails, stop and call
+`report_incomplete` with the error; do not invent findings, and never report a
+repository as clean on a failed read.
 
 ## Targets
 
@@ -228,7 +221,8 @@ the workspace, and created the `automated-health` label on each target.
 1. Read `health-audit-targets.txt` and audit exactly those repositories. If the
    file is missing or empty, fall back to discovery: every repository owned by
    `${{ github.repository_owner }}` that is neither archived nor a fork, the
-   same filter the pipeline uses.
+   same filter the pipeline uses:
+   `gh api user/repos --paginate --jq '.[] | select(.archived == false and .fork == false) | .full_name'`.
 2. The `limit` input (`${{ github.event.inputs.limit }}`) has already been
    applied to that file. Spend the same budget the list implies; do not add
    repositories beyond it.
@@ -249,23 +243,25 @@ analyses, Dependabot alerts switched off - as a note, not a warning; it says
 nothing about the repository's health. Report any other failure as a sensor
 warning and continue with the remaining checks.
 
-1. **Dependabot alerts** - `list_dependabot_alerts` with
-   `{"owner": "<owner>", "repo": "<name>", "state": "open"}`: open alerts
-   with severity, package, summary, and alert link. If the call is rejected for
+1. **Dependabot alerts** - `gh api --paginate
+   "repos/<owner>/<repo>/dependabot/alerts?state=open"`: open alerts with
+   `security_advisory.severity`, `dependency.package.name`,
+   `security_advisory.summary`, and `html_url`. If the call is rejected for
    permissions, record the warning that the token needs `security_events`
    (classic PAT) or the matching read permission on a fine-grained PAT.
-2. **Code scanning alerts** - `list_code_scanning_alerts` with
-   `state: "open"`, called once with `severity: "critical,high"` and once with
-   `severity: "medium,low"` so each response stays bounded: severity, rule id,
-   description, and file path. Missing analyses ("not enabled for this
-   repository, or has no analyses yet") are a note, not a warning.
+2. **Code scanning alerts** - `gh api --paginate
+   "repos/<owner>/<repo>/code-scanning/alerts?state=open"`: open alerts with
+   severity, `rule.id`, `rule.description`, and
+   `most_recent_instance.location.path`. Missing analyses ("not enabled for
+   this repository, or has no analyses yet") are a note, not a warning.
 3. **npm advisories** - only when the repository has `package-lock.json` or
-   `npm-shrinkwrap.json`; list the repository root with `get_file_contents` to
-   find them. Fetch `package.json` and the lockfile with `get_file_contents`,
-   decode the base64 `content` field into a temporary directory outside the
-   checkout, and run `npm audit --json` there. Report every finding whose
-   severity is not `info` with its severity, package, and advisory title. A
-   lockfile that cannot be parsed is a sensor warning.
+   `npm-shrinkwrap.json`; list the repository root with
+   `gh api "repos/<owner>/<repo>/contents"` to find them. Fetch `package.json`
+   and the lockfile with `gh api "repos/<owner>/<repo>/contents/<path>" --jq
+   .content | base64 -d` into a temporary directory outside the checkout, then
+   run `npm audit --json` there. Report every finding whose severity is not
+   `info` with its severity, package, and advisory title. A lockfile that
+   cannot be parsed is a sensor warning.
 4. **Python advisories** - only when the repository has `requirements*.txt`.
    Fetch each file the same way and run `pip-audit -r <file> --format=json`. If
    `pip-audit` is not on `PATH`, install it with
@@ -273,35 +269,35 @@ warning and continue with the remaining checks.
    warning instead of guessing. Report each vulnerable package with its fix
    versions (or "no fix available") and the advisory id.
 5. **GitHub Actions pinning** - list `.github/workflows` with
-   `get_file_contents` and read every `*.yml` and `*.yaml` file in it. Collect
-   every external `uses:` reference. A reference is pinned when it is a
-   40-character commit SHA, or when it appears in that workflow's entry in
-   `.github/workflows/actions.lock` (the workflow is onboarded and the locked
-   commit is what Actions executes). Local paths, `docker://` images, and
-   expression-based refs are not versioned actions and are ignored. Report each
-   unpinned reference with its file, line number, and the reason (`not in
-   actions.lock for this workflow`, `no ref specified`, or `ref '<ref>' is not
-   a commit SHA`).
-6. **GitHub Actions versions** - for each distinct `uses: owner/repo@ref`, call
-   `get_latest_release` for `owner/repo` once per run and cache the answer. A
-   floating major tag such as `@v7` tracks its own major line and is reported
-   only once the action has moved to a newer major; a full version such as
-   `@v4.4.0` must be the newest release in its major. Resolve commit pins back
-   to the ref they were locked from through `actions.lock`; skip a reference
-   whose version cannot be resolved. Report the version to move to, never an
-   older version, and note when the current ref is a commit pin.
-7. **Primary language** - call `search_repositories` with
-   `{"query": "<owner>/<name> in:fullname"}` and read `language` from the one
-   result. The supported set is
+   `gh api "repos/<owner>/<repo>/contents/.github/workflows"` and read every
+   `*.yml` and `*.yaml` file in it. Collect every external `uses:` reference. A
+   reference is pinned when it is a 40-character commit SHA, or when it appears
+   in that workflow's entry in `.github/workflows/actions.lock` (the workflow is
+   onboarded and the locked commit is what Actions executes). Local paths,
+   `docker://` images, and expression-based refs are not versioned actions and
+   are ignored. Report each unpinned reference with its file, line number, and
+   the reason (`not in actions.lock for this workflow`, `no ref specified`, or
+   `ref '<ref>' is not a commit SHA`).
+6. **GitHub Actions versions** - for each distinct `uses: owner/repo@ref`,
+   resolve `gh api "repos/owner/repo/releases/latest"` once per action and
+   cache the answer. A floating major tag such as `@v7` tracks its own major
+   line and is reported only once the action has moved to a newer major; a full
+   version such as `@v4.4.0` must be the newest release in its major. Resolve
+   commit pins back to the ref they were locked from through `actions.lock`;
+   skip a reference whose version cannot be resolved. Report the version to
+   move to, never an older version, and note when the current ref is a commit
+   pin.
+7. **Primary language** - `gh api "repos/<owner>/<repo>" --jq
+   '{language: .language, archived: .archived}'`. The supported set is
    `Python Shell TypeScript Scala JavaScript Unspecified`. A language outside
    that set is a note that remediation can still edit files but native test
    suites may need a custom toolchain.
-8. **Archival candidate** - call `list_commits` with
-   `{"owner": "<owner>", "repo": "<name>", "per_page": 100}` and inspect the
-   authors. The repository is a candidate when no commit in the last 100 has a
-   human author (a non-`User` author type, or a login containing `bot`, does
-   not count) in the last year. Report the date of the last human commit, or
-   that there was none.
+8. **Archival candidate** - `gh api
+   "repos/<owner>/<repo>/commits?per_page=100"` and inspect the authors. The
+   repository is a candidate when no commit in the last 100 has a human author
+   (a non-`User` author type, or a login containing `bot`, does not count) in
+   the last year. Report the date of the last human commit, or that there was
+   none.
 
 Bound the work: stop a repository's remaining checks after repeated rate-limit
 or network failures, and do not retry the same failing call more than twice.
@@ -315,9 +311,9 @@ warnings alone do not justify an issue.
 
 - Title: `🛡️ [Health Audit] Security Vulnerabilities & Dependency Maintenance`
 - Label: `automated-health`
-- Before creating, call `list_issues` with
-  `{"owner": "<owner>", "repo": "<name>", "labels": "automated-health", "state": "OPEN"}`
-  and look for an existing issue with the `automated-health` label. Update that
+- Before creating, list the repository's open issues with
+  `gh api "repos/<owner>/<repo>/issues?labels=automated-health&state=open"` and
+  look for an existing issue with the `automated-health` label. Update that
   issue's body instead of creating a duplicate; the pipeline treats the first
   open issue as the remediation target.
 - Target the audited repository, never this repository, when creating or

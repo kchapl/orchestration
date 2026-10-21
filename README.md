@@ -181,16 +181,17 @@ Actions runs. Edit the Markdown, never the lock file.
   list, publishes it as the `health-audit-targets` artifact, and creates the
   `automated-health` label where it is missing, because the remediation
   pipeline finds issues by label and issue creation fails without it. The agent
-  then audits each repository with the read-only GitHub MCP server (Dependabot
-  and code scanning alerts, repository metadata, commit history, releases,
-  workflow files) and shell commands for the local dependency audits (`npm
-  audit`, `pip-audit`, npm and PyPI network access), and raises or refreshes one
-  health issue per repository with findings. Issue bodies keep the pipeline's
-  section order so phase 2 can read them. The sandbox carries no GitHub
-  credentials (`gh` is unauthenticated there, and `api.github.com` is not
-  reachable), so every GitHub read goes through the MCP server, which the
-  engine mounts as the `github` command on `PATH` and authenticates with
-  `ORCHESTRATOR_PAT`.
+  then audits each repository with `gh` (Dependabot and code scanning alerts,
+  repository metadata, commit history, releases, workflow files) and shell
+  commands for the local dependency audits (`npm audit`, `pip-audit`, npm and
+  PyPI network access), and raises or refreshes one health issue per repository
+  with findings. Issue bodies keep the pipeline's section order so phase 2 can
+  read them. `tools.github.mode: gh-proxy` makes `gh` pre-authenticated without
+  putting the token in the sandbox: a host CLI proxy started by the workflow
+  holds `ORCHESTRATOR_PAT`, and the agent's `gh` traffic is relayed to it under
+  the same public-repository guard policy as the rest of the pipeline. The
+  agent container excludes `GH_TOKEN`, and `api.github.com` is only reachable
+  through that proxy.
 - **Writes:** the agent job is read-only. Issues are created or updated by the
   isolated safe-outputs job with `ORCHESTRATOR_PAT`, targeted at the audited
   repository.
