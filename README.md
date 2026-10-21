@@ -169,6 +169,14 @@ Actions runs. Edit the Markdown, never the lock file.
   the run fails at model selection before inference. The Gemini engine keeps
   the model; it is deprecated upstream in favour of Agy but still supported.
   It authenticates with `GEMINI_API_KEY`.
+- **Sandbox:** the AWF firewall is pinned to `v0.28.73` because the compiler's
+  bundled `v0.28.57` stages the Gemini CLI system settings under
+  `$HOME/.awf`, which Gemini CLI `0.64.0` refuses to load because the directory
+  is not root-owned, so the agent exits `41` with `Invalid auth method
+  selected.` before inference. `v0.28.73` stages the same file under the
+  root-owned `/etc/awf/gemini-cli/`. The three container roles are digest-pinned
+  in frontmatter because the compiler's digest table only covers its bundled
+  version.
 - **Behavior:** a deterministic `prepare-targets` job resolves the repository
   list, publishes it as the `health-audit-targets` artifact, and creates the
   `automated-health` label where it is missing, because the remediation

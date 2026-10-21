@@ -42,6 +42,21 @@ engine:
   model: gemini-3.5-flash-lite
   version: "0.64.0"
 
+# AWF v0.28.73 stages the Gemini CLI system settings under /etc/awf, a
+# root-owned path the CLI accepts. The compiler's default v0.28.57 writes them
+# under $HOME/.awf, which Gemini CLI 0.64.0 rejects as insecure, so the run
+# exits 41 with "Invalid auth method selected" before inference.
+sandbox:
+  agent:
+    id: awf
+    version: v0.28.73
+    # The compiler's digest table only covers its bundled version, so the three
+    # roles this workflow uses are pinned here from the v0.28.73 containers.txt.
+    images:
+      agent: ghcr.io/github/gh-aw-firewall/agent:0.28.73@sha256:3904bccb0693f73bc19fb8a82d5c9cd95040ae96d99e881967f8ca212d9d6a1a
+      api-proxy: ghcr.io/github/gh-aw-firewall/api-proxy:0.28.73@sha256:a1860172a0d22b5f8190bde334794b5ed7dd93dd79583d09fbce8fe8c1751a56
+      squid: ghcr.io/github/gh-aw-firewall/squid:0.28.73@sha256:fa0620bd3506ee69e450426a9f2ac8b13a81544604c244d2de2b0106eb03809f
+
 # The audit reads other repositories, so the agent needs the orchestrator PAT
 # rather than the workflow's repository-scoped token.
 tools:
