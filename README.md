@@ -151,12 +151,57 @@ REPO=owner/name AUDIT_RECORD_DIR=records ./.github/scripts/audit-repo.sh
 ./.github/scripts/render-report.sh records >> "$GITHUB_STEP_SUMMARY"
 ```
 
+### Manual agentic audit (experimental)
+
+`.github/workflows/manual-health-audit.md` is the on-demand agentic counterpart
+of phase 1. It is a GitHub Agentic Workflow: `gh aw compile` renders it to
+`.github/workflows/manual-health-audit.lock.yml`, and the lock file is what
+Actions runs. Edit the Markdown, never the lock file.
+
+- **Trigger:** `workflow_dispatch` only. Inputs are `repos` (comma-separated
+  `owner/name`, blank discovers every non-archived, non-fork repository with
+  the same filter the pipeline uses) and `limit` (maximum repositories per run,
+  `0` = no cap).
+- **Engine:** `agy` (Google Antigravity CLI) on `gemini-3.5-flash-lite` — the
+  same Flash-Lite model phase 2 uses — pinned to the native release this
+  compiler verifies (`1.3.3`; the upstream catalog lists `1.3.6`, so a newer
+  gh-aw compiler can move the pin). It authenticates with `GEMINI_API_KEY`;
+  `GOOGLE_API_KEY`, ADC, WIF, and Vertex AI are not supported by this engine.
+- **Behavior:** a deterministic `prepare-targets` job resolves the repository
+  list, publishes it as the `health-audit-targets` artifact, and creates the
+  `automated-health` label where it is missing, because the remediation
+  pipeline finds issues by label and issue creation fails without it. The agent
+  then audits each repository with GitHub tools (Dependabot and code scanning
+  alerts, repository metadata, commit history, releases, workflow files) and
+  shell commands (`npm audit`, `pip-audit`, PyPI and npm network access), and
+  raises or refreshes one health issue per repository with findings. Issue
+  bodies keep the pipeline's section order so phase 2 can read them.
+- **Writes:** the agent job is read-only. Issues are created or updated by the
+  isolated safe-outputs job with `ORCHESTRATOR_PAT`, targeted at the audited
+  repository.
+- **Security:** threat detection is disabled because the Agy engine has no
+  detector pass; the agent job holds no write permission and every write is
+  staged through safe outputs. The audit never modifies source files.
+- **Cost:** one agent conversation covers the whole run, so `limit` bounds how
+  many repositories one dispatch handles; each repository costs model turns
+  against the Gemini free-tier request quota. The agentic step is capped at 45
+  minutes and the concurrency group queues manual runs.
+- **Scope:** this workflow raises issues; it does not open pull requests. Phase
+  2 remediation stays in `daily-health-check.yml`, which consumes the same
+  issues.
+
+Regenerate the lock file after editing the Markdown:
+
+```sh
+gh aw compile manual-health-audit
+```
+
 ### Required secrets
 
 | Secret | Purpose |
 | --- | --- |
-| `ORCHESTRATOR_PAT` | repo discovery, issue writes, checkouts, PR pushes |
-| `GEMINI_API_KEY` | Google AI Studio API key for OpenHands model access in phase 2 |
+| `ORCHESTRATOR_PAT` | repo discovery, cross-repository reads, issue writes, checkouts, PR pushes |
+| `GEMINI_API_KEY` | Google AI Studio API key for OpenHands model access in phase 2 and for the Agy engine in the manual audit |
 
 Create or manage a Gemini API key in [Google AI Studio](https://aistudio.google.com/api-keys),
 then add it to this repository's Actions secrets as `GEMINI_API_KEY`.

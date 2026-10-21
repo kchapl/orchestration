@@ -318,6 +318,9 @@ lockfile_commit_map() {
 # Every external "uses:" reference, as "<workflow path>\t<line>\t<ref>" lines.
 # Local paths, docker:// images, and expression-based refs are not versioned
 # actions, so both workflow sensors ignore them.
+# Only workflow YAML is scanned: a .github/workflows/*.md file is an agentic
+# workflow source whose steps are compiled into its .lock.yml, and the lock file
+# is what Actions executes and what these sensors must judge.
 workflow_uses() {
   local wf_dir="$TARGET_DIR/.github/workflows" hit file rest lineno text uses rel
   [[ -d $wf_dir ]] || return 0
@@ -335,7 +338,8 @@ workflow_uses() {
     [[ $uses == *'${{'* ]] && continue
     rel=${file#"$TARGET_DIR"/}
     printf '%s\t%s\t%s\n' "$rel" "$lineno" "$uses"
-  done < <(grep -rInE '^[[:space:]]*(-[[:space:]]+)?uses:' "$wf_dir" 2>/dev/null)
+  done < <(grep -rInE --include='*.yml' --include='*.yaml' \
+    '^[[:space:]]*(-[[:space:]]+)?uses:' "$wf_dir" 2>/dev/null)
 }
 
 # Flags "uses:" references that are not pinned: either a full commit SHA, or a
