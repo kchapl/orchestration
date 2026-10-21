@@ -204,7 +204,7 @@ gh aw compile manual-health-audit
 | Secret | Purpose |
 | --- | --- |
 | `ORCHESTRATOR_PAT` | repo discovery, cross-repository reads, issue writes, checkouts, PR pushes |
-| `GEMINI_API_KEY` | Google AI Studio API key for OpenHands model access in phase 2 and for the Agy engine in the manual audit |
+| `GEMINI_API_KEY` | Google AI Studio API key for OpenHands model access in phase 2 and for the Gemini engine in the manual audit |
 
 Create or manage a Gemini API key in [Google AI Studio](https://aistudio.google.com/api-keys),
 then add it to this repository's Actions secrets as `GEMINI_API_KEY`.
