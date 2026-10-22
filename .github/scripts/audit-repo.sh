@@ -23,6 +23,9 @@
 #   DRY_RUN     1 = print the issue body and exit without touching GitHub
 #   AUDIT_RECORD_DIR  when set, write a JSON inventory record for this repo
 #                     into that directory (consumed by render-report.sh)
+#   BODY_FILE   when set, write the rendered issue body to that path, so a
+#               caller can publish it later instead of letting the sensor job
+#               decide. Written whether or not there are findings.
 
 set -uo pipefail
 
@@ -34,6 +37,7 @@ REPO=${REPO:-}
 TARGET_DIR=${TARGET_DIR:-$PWD}
 DRY_RUN=${DRY_RUN:-0}
 AUDIT_RECORD_DIR=${AUDIT_RECORD_DIR:-}
+BODY_FILE=${BODY_FILE:-}
 
 WORKDIR=""
 cleanup() { [[ -n $WORKDIR ]] && rm -rf "$WORKDIR"; }
@@ -626,6 +630,13 @@ FINDINGS=$(( $(count_lines "$WORKDIR/dependabot") + $(count_lines "$WORKDIR/code
   + $(count_lines "$WORKDIR/language") + $(count_lines "$WORKDIR/archival") ))
 
 write_record || warn "could not write the audit record for $REPO"
+
+# Hand the body to a caller that publishes it in a later job. Written even with
+# no findings so the caller never has to guess whether a body exists.
+if [[ -n $BODY_FILE ]]; then
+  mkdir -p "$(dirname "$BODY_FILE")" || fail "could not create $(dirname "$BODY_FILE")"
+  printf '%s\n' "$BODY" >"$BODY_FILE" || fail "could not write $BODY_FILE"
+fi
 
 if ((FINDINGS == 0)); then
   log "No actionable findings for $REPO; no issue raised."
