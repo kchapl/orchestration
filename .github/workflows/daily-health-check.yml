@@ -169,7 +169,7 @@ jobs:
       # The OpenHands 1.x CLI is a Python tool; the script installs it in this
       # job and runs it directly in the repository checkout.
       - name: Set up uv
-        uses: astral-sh/setup-uv@v10.3.0
+        uses: astral-sh/setup-uv@v10.3.2
         with:
           version: "0.13.1"
 
