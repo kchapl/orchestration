@@ -53,6 +53,12 @@ tools:
     toolsets: [repos, issues, pull_requests]
 steps:
   - name: Resolve latest Scala LTS and build the repository plan
+    # Custom steps do not receive the dispatch inputs automatically, and the plan
+    # reads these two to honour `repos` and `max_repos` instead of scanning every
+    # repository with the full ten-per-run quota.
+    env:
+      GH_AW_INPUTS_REPOS: ${{ inputs.repos }}
+      GH_AW_INPUTS_MAX_REPOS: ${{ inputs.max_repos }}
     run: |
       set -euo pipefail
       mkdir -p /tmp/gh-aw/data
