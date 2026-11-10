@@ -59,6 +59,7 @@ steps:
     env:
       GH_AW_INPUTS_REPOS: ${{ inputs.repos }}
       GH_AW_INPUTS_MAX_REPOS: ${{ inputs.max_repos }}
+      SCALA_LTS_PAT: ${{ secrets.SCALA_LTS_PAT }}
     run: |
       set -euo pipefail
       mkdir -p /tmp/gh-aw/data
@@ -66,10 +67,17 @@ steps:
       import json, os, re, urllib.request
 
       DATA = "/tmp/gh-aw/data"
+      TOKEN = os.environ.get("SCALA_LTS_PAT") or ""
       UA = {"User-Agent": "gh-aw-scala-lts-upgrade"}
 
       def get(url):
-          with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
+          headers = dict(UA)
+          if TOKEN and url.startswith("https://api.github.com/"):
+              # Anonymous REST reads are rate-limited and blind to private
+              # repositories; reuse the token the workflow already writes with.
+              headers["Authorization"] = "Bearer " + TOKEN
+              headers["Accept"] = "application/vnd.github+json"
+          with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
               return r.read().decode("utf-8", "replace")
 
       page = get("https://www.scala-lang.org/download/")
@@ -119,11 +127,28 @@ steps:
           try:
               build = get(f"https://raw.githubusercontent.com/kchapl/{name}/{branch}/build.sbt")
           except Exception:
-              continue
-          m = re.search(r'scalaVersion\s*:?=\s*"([^"]+)"', build)
-          flags = sorted(set(re.findall(r'"(-Werror|-Xfatal-warnings|-deprecation|-unchecked|-Wunused[^"]*)"', build)))
-          current = m.group(1) if m else None
-          kind = classify(current, lts_version)
+              build = None
+
+          def declared_version(text):
+              # `scalaVersion := "3.3.5"`, and the sbt template's
+              # `val scala3Version = "3.3.5"` / `scalaVersion := scala3Version`.
+              # A dotted reference such as Dependencies.scalaVersion is not resolved.
+              if text is None:
+                  return None
+              m = re.search(r'scalaVersion\s*:?=\s*"([^"]+)"', text)
+              if m:
+                  return m.group(1)
+              m = re.search(r'scalaVersion\s*:?=\s*([A-Za-z_][A-Za-z0-9_]*)', text)
+              if m:
+                  val = re.search(r'(?:val|def)\s+' + re.escape(m.group(1)) + r'\s*(?::\s*String\s*)?=\s*"([^"]+)"', text)
+                  if val:
+                      return val.group(1)
+              return None
+
+          flags = sorted(set(re.findall(r'"(-Werror|-Xfatal-warnings|-deprecation|-unchecked|-Wunused[^"]*)"', build or "")))
+          current = declared_version(build)
+          # A repository without a readable root build.sbt is reported, not dropped.
+          kind = classify(current, lts_version) if build is not None else "unparsed_version"
           entry = {
               "repo": name,
               "default_branch": branch,
@@ -132,19 +157,25 @@ steps:
               "kind": kind,
               "open_upgrade_pr": None,
               "previous_pr": None,
+              "pr_check_failed": None,
               "needs_upgrade": kind in ("upgrade", "major_upgrade"),
               "deferred": False,
           }
           if entry["needs_upgrade"]:
               try:
                   prs = json.loads(get(f"https://api.github.com/repos/kchapl/{name}/pulls?state=all&per_page=100"))
-              except Exception:
-                  prs = []
+              except Exception as error:
+                  # Without the PR list the plan cannot tell whether an upgrade is
+                  # already open, and publishing with recreate-ref would delete the
+                  # branch behind it. Block the repository instead of guessing.
+                  entry["pr_check_failed"] = str(error) or error.__class__.__name__
+                  prs = None
+
               def target_version(pr):
                   m = re.search(r"Scala\s+(\d+\.\d+\.\d+)", pr.get("title") or "")
                   return m.group(1) if m else None
 
-              for pr in prs:
+              for pr in prs or []:
                   if pr["head"]["ref"] != "scala-lts-upgrade":
                       continue
                   if pr["state"] == "open":
@@ -167,13 +198,16 @@ steps:
 
       limit_raw = (os.environ.get("GH_AW_INPUTS_MAX_REPOS") or "").strip()
       limit = min(int(limit_raw), 10) if limit_raw else 10
-      eligible = [e for e in plan if e["needs_upgrade"] and e["open_upgrade_pr"] is None]
+      eligible = [e for e in plan
+                  if e["needs_upgrade"] and e["open_upgrade_pr"] is None and not e["pr_check_failed"]]
       for e in eligible[limit:]:
           e["deferred"] = True
 
       for e in plan:
           if e["open_upgrade_pr"]:
               e["status"] = "pr_open"
+          elif e["pr_check_failed"]:
+              e["status"] = "pr_check_failed"
           elif e["previous_pr"]:
               e["status"] = e["previous_pr"]["state"]
           elif not e["needs_upgrade"]:
@@ -225,16 +259,17 @@ safe-outputs:
     recreate-ref: true
     protected-files: allowed
     max-patch-files: 50
+    # Keep this list in sync with the Scala repositories the planner may upgrade.
+    # The plan is discovered dynamically from build.sbt, so a repository missing
+    # here is still cloned, built and tested before safe-outputs refuses its PR,
+    # while entries for non-Scala repositories only widen the write surface.
     allowed-repos:
       - kchapl/ai-studio
       - kchapl/book-lamp
       - kchapl/catalyst
-      - kchapl/dotfiles
       - kchapl/energy-analysis
       - kchapl/gh-mission
       - kchapl/greentech
-      - kchapl/kchapl.github.io
-      - kchapl/orchestration
       - kchapl/play-scala-seed
       - kchapl/rocket
       - kchapl/thickening-plot
@@ -269,7 +304,11 @@ Existing tracker issue: `/tmp/gh-aw/data/tracker.json`
 
 Read all three files first. Each plan entry carries `repo`, `default_branch`, `scala_version`, `compiler_flags`, `kind`, `open_upgrade_pr`, `needs_upgrade`, `deferred`, and the pre-computed `status`.
 
-Only entries with `status: pending` need work. Every other status is final for this run: `already_current`, `pr_open`, `pr_closed`, `pr_merged`, `deferred`, `no_scala_version`, `ahead_of_lts`, `unparsed_version`. A `pr_closed` entry means a human already declined an upgrade pull request **for this run's target release** on that branch; do not raise it again. The plan only reports `pr_closed` or `pr_merged` when the earlier pull request targeted the current `lts_version`, so a repository whose upgrade to an older LTS was merged or declined stays `pending` and still gets the newer release.
+Only entries with `status: pending` need work. Every other status is final for this run: `already_current`, `pr_open`, `pr_closed`, `pr_merged`, `pr_check_failed`, `deferred`, `no_scala_version`, `ahead_of_lts`, `unparsed_version`. A `pr_closed` entry means a human already declined an upgrade pull request **for this run's target release** on that branch; do not raise it again. The plan only reports `pr_closed` or `pr_merged` when the earlier pull request targeted the current `lts_version`, so a repository whose upgrade to an older LTS was merged or declined stays `pending` and still gets the newer release.
+
+A `pr_check_failed` entry means the run could not read that repository's pull requests, so it cannot tell whether an upgrade is already open. Never work on it: publishing with `recreate-ref` deletes the branch, which would discard the work behind an existing pull request. Its `pr_check_failed` field holds the error text; report that as the row's failure reason in the tracker.
+
+`no_scala_version` and `unparsed_version` mean the plan could not determine a comparable Scala version (for example no root `build.sbt`, or a version it cannot resolve); leave those repositories alone and report the status as-is.
 
 Entries with `kind: major_upgrade` are still on Scala 2 and need a migration, not a version bump. Entries with `kind: upgrade` are already on Scala 3 and need only a patch or minor bump.
 
@@ -322,8 +361,8 @@ Publish one tracker issue in `{{ github.repository }}` titled `Scala LTS upgrade
 
 - `### Latest run` - date, target `lts_version`, run mode, and the number of repositories examined.
 - `### Repository status` - one table row per plan entry: repository, previous version, resulting status, and the pull request link or failure reason.
-- `### Summary` - counts for pull requests raised (separating Scala 3 upgrades from Scala 2 migrations), already current, upgrade pull request already open, upgrade declined or merged, not possible, ahead of LTS, and deferred by the run limit. The pull requests raised plus the not-possible count together answer how many eligible repositories received or failed to receive an upgrade.
-- `### Problems` - the blocking error, warning or deprecation for each `not_possible` entry, collapsed in a `<details>` block when long.
+- `### Summary` - counts for pull requests raised (separating Scala 3 upgrades from Scala 2 migrations), already current, upgrade pull request already open, upgrade declined or merged, pull request discovery failed, not possible, ahead of LTS, and deferred by the run limit. The pull requests raised plus the not-possible count together answer how many eligible repositories received or failed to receive an upgrade.
+- `### Problems` - the blocking error, warning or deprecation for each `not_possible` entry, and the discovery error for each `pr_check_failed` entry, collapsed in a `<details>` block when long.
 
 On later runs, update the existing tracker issue instead of creating a second one. Keep the body self-contained: it should always describe the current state, not accumulate history.
 
@@ -337,4 +376,4 @@ Use `###` for top-level sections and `####` for subsections. Use GitHub-flavored
 
 ## No-op conditions
 
-Call `noop` with a short reason when every plan entry is `already_current`, `pr_open`, `deferred`, or `no_scala_version`, and the tracker issue already reflects that state. Do not publish an empty report and do not open a repository for investigation when the plan says it needs none.
+Call `noop` with a short reason when every plan entry is `already_current`, `pr_open`, `deferred`, or `no_scala_version`, and the tracker issue already reflects that state. Never call `noop` when any entry is `pr_check_failed`: publish the tracker so the discovery error is visible. Do not publish an empty report and do not open a repository for investigation when the plan says it needs none.
