@@ -1,0 +1,144 @@
+# The agent workflow fails closed when the model provider is unavailable: Agy
+# retries the API call seven times, then hits its five-minute print timeout and
+# exits 1 with no safe output. Nothing is published, but the run is red and the
+# failure issue gh-aw opens only sees a driver exit code, so it reports
+# "finished without a clear failure cause".
+#
+# This watchdog reads the provider error out of the completed job log, comments
+# it on that issue, and re-runs the failed jobs once when the failure looks
+# transient. Re-running keeps the original dispatch inputs and attempt number,
+# so at most one automatic retry happens per dispatch.
+
+name: Scala LTS Upgrade retry
+
+on:
+  workflow_run:
+    workflows: ["Scala LTS Upgrade"]
+    types: [completed]
+
+permissions:
+  actions: write
+  issues: write
+
+concurrency:
+  group: scala-lts-upgrade-retry-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+    steps:
+      - name: Read the failure out of the job log
+        id: read
+        run: |
+          set -euo pipefail
+          job_id=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '[.jobs[] | select(.conclusion == "failure")][0].id // empty')
+          cause=""
+          if [ -n "$job_id" ]; then
+            if gh api "repos/$REPO/actions/jobs/$job_id/logs" > /tmp/job.log 2>/dev/null; then
+              # The log endpoint answers with a zip when archived, plain text otherwise.
+              if unzip -l /tmp/job.log >/dev/null 2>&1; then
+                unzip -p /tmp/job.log > /tmp/job.txt 2>/dev/null || cp /tmp/job.log /tmp/job.txt
+              else
+                cp /tmp/job.log /tmp/job.txt
+              fi
+              sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/job.txt > /tmp/job.clean
+              # The harness reports the upstream error last, so keep the final one.
+              cause=$(grep -aoE 'API error \(attempt [0-9]+\): [^"]{0,300}' /tmp/job.clean | tail -1 || true)
+              if [ -z "$cause" ]; then
+                cause=$(grep -aoiE '(error (429|5[0-9][0-9])[^"]{0,200}|(high demand|rate limit|timed out|timeout|connection reset|Could not resolve host)[^"]{0,120})' \
+                  /tmp/job.clean | tail -1 || true)
+              fi
+            fi
+          fi
+          # Decide on signatures in the log itself, never on the fallback prose:
+          # matching the message below would retry a run that never timed out.
+          signal=""
+          if [ -f /tmp/job.clean ]; then
+            signal=$(grep -aoiE 'high demand|UNAVAILABLE|rate limit|Error 429|Error 5[0-9][0-9]|print timeout|timed out|connection reset|Could not resolve host' \
+              /tmp/job.clean | head -1 || true)
+          fi
+          if [ -z "$cause" ]; then
+            if [ -n "$job_id" ]; then
+              cause="the failed job log carried no recognizable error line"
+            else
+              cause="no failed job was found in the run"
+            fi
+          fi
+          {
+            echo 'cause<<CAUSE'
+            printf '%s\n' "$cause"
+            echo 'CAUSE'
+            echo "signal=$signal"
+          } >> "$GITHUB_OUTPUT"
+          echo "cause: $cause (signal: ${signal:-none})"
+
+      - name: Decide whether the failure is worth retrying
+        id: decide
+        env:
+          SIGNAL: ${{ steps.read.outputs.signal }}
+        run: |
+          set -euo pipefail
+          note="attempt $ATTEMPT already used the automatic retry, so it is left for a human"
+          retry=false
+          if [ "$ATTEMPT" -eq 1 ]; then
+            if [ -n "$SIGNAL" ]; then
+              retry=true
+              note="transient provider failure ($SIGNAL), so the failed jobs are being re-run once"
+            else
+              note="the failure log carried no transient provider signal, so no retry is attempted"
+            fi
+          fi
+          echo "retry=$retry" >> "$GITHUB_OUTPUT"
+          echo "note=$note" >> "$GITHUB_OUTPUT"
+          echo "retry=$retry — $note"
+
+      - name: Comment the cause on the failure issue
+        if: always()
+        env:
+          CAUSE: ${{ steps.read.outputs.cause }}
+          RETRY_NOTE: ${{ steps.decide.outputs.note }}
+        run: |
+          set -euo pipefail
+          marker="<!-- scala-lts-upgrade-retry:$RUN_ID:$ATTEMPT -->"
+          number=$(gh issue list --repo "$REPO" --state open --label agentic-workflows --limit 100 \
+            --json number,title,body \
+            | jq -r --arg url "runs/$RUN_ID" \
+                '[.[] | select(.title | startswith("[aw] Scala LTS Upgrade"))
+                      | select(.body | contains($url))]
+                 | sort_by(.number) | last | .number // empty')
+          if [ -z "$number" ]; then
+            echo "no failure issue references $RUN_URL; nothing to annotate"
+            exit 0
+          fi
+          if gh api "repos/$REPO/issues/$number/comments" --paginate --jq '.[].body' | grep -qF "$marker"; then
+            echo "issue #$number already carries the cause for attempt $ATTEMPT"
+            exit 0
+          fi
+          body=$(mktemp)
+          {
+            echo "$marker"
+            echo
+            echo "### Failure cause"
+            echo
+            printf '```text\n%s\n```\n\n' "$CAUSE"
+            echo "- Run: $RUN_URL (attempt $ATTEMPT)"
+            echo "- Retry: $RETRY_NOTE"
+          } > "$body"
+          gh issue comment "$number" --repo "$REPO" --body-file "$body"
+          echo "commented on #$number"
+
+      - name: Re-run the failed jobs once
+        if: steps.decide.outputs.retry == 'true'
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/rerun-failed-jobs" >/dev/null
+          echo "re-ran the failed jobs of run $RUN_ID"
