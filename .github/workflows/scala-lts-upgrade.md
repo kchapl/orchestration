@@ -4,7 +4,6 @@ description: Raise one verified Scala LTS upgrade pull request per eligible kcha
 intent: Keep kchapl's Scala projects on the latest Scala LTS release by raising at most one verified upgrade pull request per repository, leaving current repositories and existing upgrade pull requests untouched.
 emoji: 🪜
 on:
-  schedule: weekly
   workflow_dispatch:
     inputs:
       repos:
@@ -30,6 +29,19 @@ concurrency:
   queue: single
   job-discriminator: ${{ github.run_id }}
 checkout: false
+# `checkout: false` drops the agent job's clone, but the generated safe_outputs
+# job still configures git credentials before it can apply a
+# create-pull-request output, and that script runs `git remote set-url origin`.
+# Give that job a checkout of this repository so the credentials step has an
+# origin remote to update instead of failing in a workspace with no `.git`.
+jobs:
+  safe_outputs:
+    pre-steps:
+      - name: Check out the workflow repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          token: ${{ secrets.SCALA_LTS_PAT }}
 engine: agy
 timeout-minutes: 180
 network:
@@ -122,14 +134,29 @@ steps:
                   prs = json.loads(get(f"https://api.github.com/repos/kchapl/{name}/pulls?state=all&per_page=100"))
               except Exception:
                   prs = []
+              def target_version(pr):
+                  m = re.search(r"Scala\s+(\d+\.\d+\.\d+)", pr.get("title") or "")
+                  return m.group(1) if m else None
+
               for pr in prs:
                   if pr["head"]["ref"] != "scala-lts-upgrade":
                       continue
                   if pr["state"] == "open":
                       entry["open_upgrade_pr"] = {"number": pr["number"], "title": pr["title"], "url": pr["html_url"]}
                       break
+                  # A merged or declined pull request only settles the release it
+                  # targeted: an upgrade to an older LTS must not block the next one.
+                  # A title this workflow did not write keeps the conservative answer.
+                  if target_version(pr) not in (None, lts_version):
+                      continue
                   if entry["previous_pr"] is None:
-                      entry["previous_pr"] = "pr_merged" if pr.get("merged_at") else "pr_closed"
+                      entry["previous_pr"] = {
+                          "state": "pr_merged" if pr.get("merged_at") else "pr_closed",
+                          "number": pr["number"],
+                          "title": pr["title"],
+                          "url": pr["html_url"],
+                          "target": target_version(pr),
+                      }
           plan.append(entry)
 
       limit_raw = (os.environ.get("GH_AW_INPUTS_MAX_REPOS") or "").strip()
@@ -142,7 +169,7 @@ steps:
           if e["open_upgrade_pr"]:
               e["status"] = "pr_open"
           elif e["previous_pr"]:
-              e["status"] = e["previous_pr"]
+              e["status"] = e["previous_pr"]["state"]
           elif not e["needs_upgrade"]:
               e["status"] = e["kind"]
           elif e["deferred"]:
@@ -236,7 +263,7 @@ Existing tracker issue: `/tmp/gh-aw/data/tracker.json`
 
 Read all three files first. Each plan entry carries `repo`, `default_branch`, `scala_version`, `compiler_flags`, `kind`, `open_upgrade_pr`, `needs_upgrade`, `deferred`, and the pre-computed `status`.
 
-Only entries with `status: pending` need work. Every other status is final for this run: `already_current`, `pr_open`, `pr_closed`, `pr_merged`, `deferred`, `no_scala_version`, `ahead_of_lts`, `unparsed_version`. A `pr_closed` entry means a human already declined an upgrade pull request on that branch; do not raise it again.
+Only entries with `status: pending` need work. Every other status is final for this run: `already_current`, `pr_open`, `pr_closed`, `pr_merged`, `deferred`, `no_scala_version`, `ahead_of_lts`, `unparsed_version`. A `pr_closed` entry means a human already declined an upgrade pull request **for this run's target release** on that branch; do not raise it again. The plan only reports `pr_closed` or `pr_merged` when the earlier pull request targeted the current `lts_version`, so a repository whose upgrade to an older LTS was merged or declined stays `pending` and still gets the newer release.
 
 Entries with `kind: major_upgrade` are still on Scala 2 and need a migration, not a version bump. Entries with `kind: upgrade` are already on Scala 3 and need only a patch or minor bump.
 

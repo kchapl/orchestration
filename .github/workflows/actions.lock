@@ -15,6 +15,13 @@ workflows:
         - 'actions/setup-node@v7.1.0'
         - 'actions/upload-artifact@v7.0.2'
         - 'github/gh-aw-actions@v0.92.0'
+    '.github/workflows/scala-lts-upgrade.lock.yml':
+        - 'actions/checkout@v7.0.1'
+        - 'actions/download-artifact@v8.0.2'
+        - 'actions/github-script@v9.0.0'
+        - 'actions/setup-node@v7.1.0'
+        - 'actions/upload-artifact@v7.0.2'
+        - 'github/gh-aw-actions@v0.92.0'
 dependencies:
     'actions/checkout@v7.0.1':
         ref: 'v7.0.1'
